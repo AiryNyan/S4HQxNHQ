@@ -1,0 +1,27 @@
+[package]
+name = "s4hqxnhq"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "d3d11"
+crate-type = ["cdylib"]
+
+[features]
+# Log-collection build: detailed logging is always on (see build.ps1).
+diag = []
+
+[profile.release]
+opt-level = 3
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"
+
+[[bin]]
+name = "hqxtest"
+path = "src/bin/hqxtest.rs"
+
+[[bin]]
+name = "e2e"
+path = "src/bin/e2e.rs"

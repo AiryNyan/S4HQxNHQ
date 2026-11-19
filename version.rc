@@ -1,0 +1,38 @@
+// File properties shown by Windows (right-click > Properties > Details).
+// target/ver.h (VER_MAJOR, VER_MINOR, VER_PATCH, VER_STR) is written by build.ps1,
+// which also defines DIAG for the log-collection build.
+#pragma code_page(65001)
+#include "target/ver.h"
+
+#ifdef DIAG
+#define DESCRIPTION "S4HQxNHQ - HQ and non-HQ sim textures together (log build)"
+#else
+#define DESCRIPTION "S4HQxNHQ - HQ and non-HQ sim textures together"
+#endif
+
+1 VERSIONINFO
+FILEVERSION VER_MAJOR, VER_MINOR, VER_PATCH, 0
+PRODUCTVERSION VER_MAJOR, VER_MINOR, VER_PATCH, 0
+FILEOS 0x40004L
+FILETYPE 0x2L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Claude & AiryNyan"
+            VALUE "FileDescription", DESCRIPTION
+            VALUE "FileVersion", VER_STR
+            VALUE "InternalName", "S4HQxNHQ"
+            VALUE "LegalCopyright", "© 2026 Claude & AiryNyan - Fairy09.com"
+            VALUE "OriginalFilename", "d3d11.dll"
+            VALUE "ProductName", "S4HQxNHQ"
+            VALUE "ProductVersion", VER_STR
+            VALUE "Comments", "The Sims 4 mod. Download: Fairy09.com"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

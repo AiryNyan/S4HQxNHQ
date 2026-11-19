@@ -1,3 +1,5 @@
+**해당 모드(DLL 파일)은 클로드의 도움(바이브 코딩을 뜻함)을 전적으로 받았으며 실 플레이시 문제가 발생하는지는 제가 직접 해보고 있습니다**
+
 # S4HQxNHQ란?
 
 S4HQxNHQ는 심즈4에서 HQ 해상도 CC와 일반 해상도 아이템을 함께 쓸 수 있게해 주는 모드입니다.
@@ -74,6 +76,8 @@ S4HQxNHQ는 게임이 텍스처를 **읽는 순간에** 끼어듭니다.
 ---------------------------------------
 ---------------------------------------
 <br><br>
+**This mod (the DLL file) was made entirely with Claude's help (i.e., vibe coding), and I'm personally testing it in real gameplay to see whether any problems come up.**
+
 
 # What is S4HQxNHQ?
 

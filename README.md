@@ -70,3 +70,80 @@ S4HQxNHQ는 게임이 텍스처를 **읽는 순간에** 끼어듭니다.
 - CC 제작자마다 제작 방식이 달라서, non-HQ CC를 변환하는 과정에서 텍스처가 깨질 수 있습니다.
   
   이런 경우 이슈나 메일 <admin@fairy09.com> 로 어느 CC인지 알려 주시면 확인해 보겠습니다.
+<br><br>
+---------------------------------------
+---------------------------------------
+<br><br>
+
+# What is S4HQxNHQ?
+
+S4HQxNHQ is a mod for The Sims 4 that lets you use HQ-resolution CC and standard-resolution items together.
+
+## 1. Why would I use this?
+
+The Sims 4 has a tweak called HQ mode that makes the game load sim textures at 2048x4096, but it comes with a problem.
+
+- Every base game item also has to be 2048x4096.
+- Every CC item has to be made at 2048x4096 by its creator.
+- If either condition isn't met, the textures show up broken and black.
+
+Until now, the only way around this was to convert every base game outfit and every CC made at 1024x2048 to 2048x4096 yourself.
+
+## 2. How it solves this
+
+S4HQxNHQ steps in **at the moment the game reads a texture**.
+
+It checks each texture being loaded, and for standard-resolution (1024x2048) sim textures it hands the game **a copy upscaled 2x in width and height, in memory**.
+
+## 3. How is this different from the old way?
+
+- Textures are processed in real time as they load, so you don't need to convert non-HQ CC.
+- Upscaled textures are never saved to disk, so they take up no extra disk space.
+- Pixels are simply duplicated 2x2, with no interpolation or AI upscaling, so image quality is the same as the original, though it may look slightly blocky.
+
+## 4. How it works
+
+### 4-1. Loading as a d3d11.dll proxy
+
+- The game loads `d3d11.dll` from its `Game\Bin` folder before the one in the Windows system folder. S4HQxNHQ is distributed under this name.
+- It exports the same 51 functions as the system `d3d11.dll` and forwards every one of them to the real system DLL. It does not touch graphics (D3D11) behavior.
+- It only activates when the executable is named `TS4_x64.exe`.
+
+### 4-2. Intercepting file reads
+
+It replaces the addresses of the following file functions used by the game with S4HQxNHQ's own functions:
+
+`ReadFile`, `SetFilePointerEx`, `SetFilePointer`, `GetFileSizeEx`, `GetFileSize`, `CreateFileW`, `CreateFileA`, `CloseHandle`
+
+Any file other than `.package` files and `GraphicsRules.sgr` is passed straight through to the original functions.
+
+### 4-3. Upscaling textures
+
+1. When the game first reads a `.package` file, S4HQxNHQ reads the package header and index (the list of resources).
+2. For each sim texture resource (RLE2, RLES, LRLE), it reads just the start of the data to check the resolution.
+3. For textures that need upscaling, it changes their size and position in the index the game sees, in memory.
+4. When the game actually reads one of those textures, it receives the original pixels duplicated exactly 2x2.
+
+## 5. Installation
+
+- Put `d3d11.dll` in the folder that contains the game executable (`TS4_x64.exe`): `The Sims 4\Game\Bin`.
+- To uninstall, delete `d3d11.dll`.
+
+## 6. Files
+
+When the mod is working, the following files appear in the `Game\Bin` folder after you launch the game.
+
+| File | Description |
+|---|---|
+| `S4HQxNHQ.log` | Activity log. A few lines per run when everything is normal. (Up to 1 MB) |
+| `S4HQxNHQ.cache` | Cache (up to 8 MB) |
+
+- The cache does not store converted images, only **information** about which textures need to be resized.
+- If textures look broken or something goes wrong, deleting the cache file sometimes fixes it.
+
+## 7. Known issues
+
+- The first load without a cache takes longer than before.
+- Because every CC creator builds their items differently, some non-HQ CC may show broken textures after conversion.
+
+  If this happens, please let me know which CC it is through an issue or by email at <admin@fairy09.com>, and I'll take a look.

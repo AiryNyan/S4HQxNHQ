@@ -16,4 +16,4 @@ dll 파일이 알아서 텍스처 사이즈를 조절하기에 GraphicsRules.sgr
 
 admin@fairy09.com
 
-로 메일 주시면 다음 작업 때 참고해 보겠습니다
+로 메일 주시거나 이슈 열어주세요

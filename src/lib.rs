@@ -7,6 +7,7 @@
 //! No game code is read or modified, and no file on disk is changed.
 #![allow(non_snake_case, clippy::missing_safety_doc, function_casts_as_integer)]
 
+mod bytes;
 mod cache;
 mod inflate;
 mod lrle;
@@ -19,7 +20,7 @@ use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use vfs::{Cont, Pkg};
 
 type P = *mut c_void;
@@ -56,6 +57,7 @@ extern "system" {
     fn GetCurrentProcess() -> P;
     fn K32GetProcessMemoryInfo(process: P, counters: *mut [usize; 9], size: u32) -> i32;
     fn ReadProcessMemory(process: P, base: P, buf: P, size: usize, read: *mut usize) -> i32;
+    fn GetFileInformationByHandle(h: P, info: *mut [u32; 13]) -> i32;
 }
 
 const PAGE_READWRITE: u32 = 0x04;
@@ -192,7 +194,10 @@ fn note_raw(s: &str) {
 
 static OUR_BASE: AtomicUsize = AtomicUsize::new(0);
 static OUR_SIZE: AtomicUsize = AtomicUsize::new(0);
-static N_EXC: AtomicU64 = AtomicU64::new(0);
+/// Exceptions recorded, inside S4HQxNHQ and elsewhere, counted apart so that
+/// exceptions the game handles itself cannot use up the record of our own.
+static N_EXC_IN: AtomicU64 = AtomicU64::new(0);
+static N_EXC_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Records fatal-looking exceptions, then lets normal handling continue
 /// (changes nothing). The normal build records only faults inside
@@ -212,7 +217,7 @@ unsafe extern "system" fn veh(ep: *const [*const u8; 2]) -> i32 {
     if !inside && !verbose() {
         return 0;
     }
-    if N_EXC.fetch_add(1, Ordering::Relaxed) >= 6 {
+    if (if inside { &N_EXC_IN } else { &N_EXC_OUT }).fetch_add(1, Ordering::Relaxed) >= 6 {
         return 0;
     }
     let mut out = StackBuf { b: [0; 512], n: 0 };
@@ -268,7 +273,7 @@ unsafe extern "system" fn veh(ep: *const [*const u8; 2]) -> i32 {
 
 // ------------------------------------------------------------ safety level
 
-const VERSION: &str = "1.0.0";
+const VERSION: &str = "1.0.1";
 
 fn level_path() -> std::path::PathBuf {
     exe_sibling("S4HQxNHQ.level")
@@ -322,8 +327,8 @@ static N_PKG_SCANNED: AtomicU64 = AtomicU64::new(0);
 static N_PKG_CACHED: AtomicU64 = AtomicU64::new(0);
 static N_TEX: AtomicU64 = AtomicU64::new(0);
 static SCAN_MS: AtomicU64 = AtomicU64::new(0);
-/// Upscaled reads by kind: RLE2, RLES, LRLE.
-static N_KIND: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Upscaled reads by kind (see `vfs::VEntry::kind`): RLE2, RLES, LRLE, -, specular served empty, L8.
+static N_KIND: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static N_DIAG: AtomicU64 = AtomicU64::new(0);
 /// Time spent producing upscaled data (read + inflate + upscale), microseconds, and the slowest single read.
 static UP_US: AtomicU64 = AtomicU64::new(0);
@@ -331,6 +336,14 @@ static UP_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn rd<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn wr<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Run hook-side logic so that a bug in it cannot take the game down: a
@@ -372,10 +385,42 @@ struct HState {
     cont: Mutex<Cont>,
 }
 
-/// Open handles the game has used. None = not a virtualized package.
-fn handles() -> &'static RwLock<HashMap<usize, Option<Arc<HState>>>> {
-    static S: OnceLock<RwLock<HashMap<usize, Option<Arc<HState>>>>> = OnceLock::new();
+/// Identity of an open disk file: (volume serial number, file index).
+type FileId = (u32, u64);
+
+/// A handle the game has used: the file it referred to and, for a
+/// virtualized package, its state (None = left as it is).
+type Known = (Option<FileId>, Option<Arc<HState>>);
+
+/// Open handles the game has used.
+fn handles() -> &'static RwLock<HashMap<usize, Known>> {
+    static S: OnceLock<RwLock<HashMap<usize, Known>>> = OnceLock::new();
     S.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn file_id(h: P) -> Option<FileId> {
+    let mut b = [0u32; 13];
+    unsafe {
+        if GetFileType(h) != 1 || GetFileInformationByHandle(h, &mut b) == 0 {
+            return None;
+        }
+    }
+    Some((b[7], ((b[11] as u64) << 32) | b[12] as u64))
+}
+
+/// Handles opened or closed outside the game executable's own imports are
+/// not seen, and their values can come back for another file. At points
+/// where a file is typically (re)examined (size queries, seeks to the start
+/// or end, reading a package from its start) the remembered file is checked
+/// against the handle's actual file and forgotten when it differs.
+/// A handle whose identity cannot be read now (not a disk file, or the query
+/// failed) is left as it is: only a positively different file counts.
+fn recheck(h: P) {
+    let Some(stored) = rd(handles()).get(&(h as usize)).map(|e| e.0) else { return };
+    let now = file_id(h);
+    if now.is_some() && now != stored {
+        forget(h);
+    }
 }
 
 /// Open handles of GraphicsRules.sgr, with the edited copy of the file.
@@ -397,7 +442,7 @@ fn sgr_opened(h: P, path: &str) {
     }
     HQ_SEEN.store(true, Ordering::Relaxed);
     if changed > 0 {
-        sgrs().write().unwrap_or_else(|e| e.into_inner()).insert(h as usize, Arc::new(patched));
+        wr(sgrs()).insert(h as usize, Arc::new(patched));
     }
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) || verbose() {
@@ -407,14 +452,14 @@ fn sgr_opened(h: P, path: &str) {
 
 /// What is known about a handle, without looking the file up.
 fn known(h: P) -> Option<Option<Arc<HState>>> {
-    handles().read().unwrap_or_else(|e| e.into_inner()).get(&(h as usize)).cloned()
+    rd(handles()).get(&(h as usize)).map(|e| e.1.clone())
 }
 
 /// Drop what is known about a handle value (it was closed or is being reused).
 fn forget(h: P) {
     if known(h).is_some() {
-        handles().write().unwrap_or_else(|e| e.into_inner()).remove(&(h as usize));
-        sgrs().write().unwrap_or_else(|e| e.into_inner()).remove(&(h as usize));
+        wr(handles()).remove(&(h as usize));
+        wr(sgrs()).remove(&(h as usize));
     }
 }
 
@@ -424,7 +469,23 @@ fn excluded(lower_path: &str, name: &str) -> bool {
     !lower_path.contains("\\mods\\") && ["local", "avatarcache", "clientdb", "accountdatadb", "housedescription", "spotlight"].iter().any(|p| name.starts_with(p))
 }
 
-fn scan(path: &str, lower: &str) -> Option<Arc<Pkg>> {
+/// `Pkg::build`, tried a few times when the file cannot be read (it may be
+/// held by a virus scanner or a mod manager for a moment).
+fn build_retry(p: &std::path::Path, lower: &str, cached: Option<&[vfs::Planned]>) -> Result<Option<Pkg>, String> {
+    let mut r = Pkg::build(p, lower, cached, verbose());
+    for _ in 0..3 {
+        if r.is_ok() {
+            break;
+        }
+        unsafe { Sleep(50) };
+        r = Pkg::build(p, lower, cached, verbose());
+    }
+    r
+}
+
+/// Scan a package. Err: it could not be read; nothing is remembered about it,
+/// so it is tried again when the game opens it next (or next start).
+fn scan(path: &str, lower: &str) -> Result<Option<Arc<Pkg>>, String> {
     if TEST_PANIC_SCAN.load(Ordering::Relaxed) {
         panic!("test panic inside a package scan");
     }
@@ -437,14 +498,16 @@ fn scan(path: &str, lower: &str) -> Option<Arc<Pkg>> {
     if let Some(list) = &cached {
         from_cache = true;
         if !list.is_empty() || verbose() {
-            pkg = Pkg::build(p, lower, Some(list), verbose());
+            pkg = build_retry(p, lower, Some(list))?;
             if !list.is_empty() {
                 from_cache = pkg.is_some(); // a record that no longer fits is rebuilt
             }
         }
     }
     if !from_cache {
-        pkg = Pkg::build(p, lower, None, verbose());
+        pkg = build_retry(p, lower, None)?;
+        // Only a complete scan is remembered: a read failure never becomes
+        // "nothing to upscale" in the cache.
         if let Some(s) = stamp {
             cache::put(lower, s, pkg.as_ref().map(|p| p.plan.clone()).unwrap_or_default());
         }
@@ -461,12 +524,13 @@ fn scan(path: &str, lower: &str) -> Option<Arc<Pkg>> {
             let parent = path.rsplit(['\\', '/']).nth(1).unwrap_or("");
             let k = |n: u8| p.ents.iter().filter(|e| e.kind == n).count();
             format!(
-                "package {parent}/{}: {} textures will be upscaled (RLE2 {}, RLES {}, LRLE {}; {} skipped{}{}; scan {} ms)",
+                "package {parent}/{}: {} textures will be upscaled (RLE2 {}, RLES {}, LRLE {}, L8 {}; {} skipped{}{}; scan {} ms)",
                 p.name,
                 p.ents.len() - k(4),
                 k(0),
                 k(1),
                 k(2),
+                k(5),
                 p.skipped,
                 if p.dense { "; dense" } else { "" },
                 if k(4) > 0 { format!("; specular off {} (no shadow map)", k(4)) } else { String::new() },
@@ -474,7 +538,7 @@ fn scan(path: &str, lower: &str) -> Option<Arc<Pkg>> {
             )
         });
     }
-    pkg.map(Arc::new)
+    Ok(pkg.map(Arc::new))
 }
 
 unsafe fn resolve(h: P) -> Option<Arc<HState>> {
@@ -482,6 +546,7 @@ unsafe fn resolve(h: P) -> Option<Arc<HState>> {
         return v;
     }
     let mut found: Option<Arc<HState>> = None;
+    let id = file_id(h);
     if GetFileType(h) == 1 {
         let mut buf = [0u16; 2048];
         let n = GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), 2048, 0) as usize;
@@ -493,20 +558,40 @@ unsafe fn resolve(h: P) -> Option<Arc<HState>> {
                 sgr_opened(h, &path);
             } else if lower.ends_with(".package") && !excluded(&lower, name) {
                 let cell = lk(pkgs()).entry(lower.clone()).or_default().clone();
-                let scanned = cell.get_or_init(|| {
-                    let r = guarded(|| scan(&path, &lower));
-                    if r.is_none() {
-                        note(&format!("{path}: could not be read, left as it is for this session"));
+                let mut retry = false;
+                let scanned = cell.get_or_init(|| match guarded(|| scan(&path, &lower)) {
+                    Some(Ok(p)) => p,
+                    r => {
+                        static N: AtomicU64 = AtomicU64::new(0);
+                        if N.fetch_add(1, Ordering::Relaxed) < 20 {
+                            let why = match r {
+                                Some(Err(e)) => e,
+                                _ => "internal error".into(),
+                            };
+                            note(&format!("{}: could not be read ({why}), left as it is for now", path.rsplit(['\\', '/']).next().unwrap_or("")));
+                        }
+                        retry = true;
+                        None
                     }
-                    r.flatten()
                 });
+                if retry {
+                    // Not remembered: the next handle to this file scans again,
+                    // up to a few times per session (each try may wait a little).
+                    static FAILS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+                    let mut f = lk(FAILS.get_or_init(Default::default));
+                    let n = f.entry(lower.clone()).or_insert(0);
+                    *n += 1;
+                    if *n < 3 {
+                        lk(pkgs()).remove(&lower);
+                    }
+                }
                 if let Some(pkg) = scanned {
                     found = Some(Arc::new(HState { pkg: pkg.clone(), cont: Mutex::new(None) }));
                 }
             }
         }
     }
-    handles().write().unwrap_or_else(|e| e.into_inner()).insert(h as usize, found.clone());
+    wr(handles()).insert(h as usize, (id, found.clone()));
     found
 }
 
@@ -517,7 +602,7 @@ unsafe extern "system" fn h_readfile(h: P, buf: P, n: u32, read: *mut u32, ovl: 
     }
     let Some(Some(st)) = guarded(|| resolve(h)) else {
         // Not a package. The settings file gets its HQ values laid over.
-        let hq = sgrs().read().unwrap_or_else(|e| e.into_inner()).get(&(h as usize)).cloned();
+        let hq = rd(sgrs()).get(&(h as usize)).cloned();
         let Some(hq) = hq else { return f(h, buf, n, read, ovl) };
         let mut pos = -1i64;
         if SetFilePointerEx(h, 0, &mut pos, 1) == 0 || pos < 0 {
@@ -545,6 +630,13 @@ unsafe extern "system" fn h_readfile(h: P, buf: P, n: u32, read: *mut u32, ovl: 
         return f(h, buf, n, read, ovl);
     }
     let pos = pos as u64;
+    if pos == 0 {
+        // Reading a package from its start: make sure the handle still is that package.
+        guarded(|| recheck(h));
+        if known(h).is_none() {
+            return h_readfile(h, buf, n, read, ovl);
+        }
+    }
     let pkg = &st.pkg;
     if pos >= pkg.eof && !pkg.ents.is_empty() {
         let served = guarded(|| {
@@ -638,12 +730,30 @@ unsafe extern "system" fn h_createfilea(name: P, access: u32, share: u32, sa: P,
 /// from the current position only asks where the file pointer is, so it must
 /// not: in a dense package the next read could otherwise be taken for the
 /// start of another entry.
+/// A seek to exactly where the read left off (absolute or relative) also
+/// keeps it going, so a reader that positions itself before every chunk is
+/// served the same entry.
 fn seek_seen(h: P, method: u32, dist: i64) {
     if method == 1 && dist == 0 {
         return;
     }
+    if (method == 0 && dist == 0) || method == 2 {
+        recheck(h);
+    }
     if let Some(Some(st)) = known(h) {
-        *lk(&st.cont) = None;
+        let mut c = lk(&st.cont);
+        let Some((_, next, _)) = *c else { return };
+        let target = match method {
+            0 => Some(dist),
+            1 => {
+                let mut cur = 0i64;
+                (unsafe { SetFilePointerEx(h, 0, &mut cur, 1) } != 0).then(|| cur + dist)
+            }
+            _ => None,
+        };
+        if target != Some(next as i64) {
+            *c = None;
+        }
     }
 }
 
@@ -683,6 +793,7 @@ unsafe extern "system" fn h_gfsex(h: P, out: *mut i64) -> i32 {
     let f = orig!(O_GFSEX, unsafe extern "system" fn(P, *mut i64) -> i32);
     let r = f(h, out);
     if r != 0 && !out.is_null() {
+        guarded(|| recheck(h));
         if let Some(Some(st)) = guarded(|| resolve(h)) {
             *out = st.pkg.vend as i64;
         }
@@ -694,6 +805,7 @@ unsafe extern "system" fn h_gfs(h: P, hi: *mut u32) -> u32 {
     let f = orig!(O_GFS, unsafe extern "system" fn(P, *mut u32) -> u32);
     let r = f(h, hi);
     if r != u32::MAX {
+        guarded(|| recheck(h));
         if let Some(Some(st)) = guarded(|| resolve(h)) {
             if !hi.is_null() {
                 *hi = (st.pkg.vend >> 32) as u32;
@@ -705,7 +817,8 @@ unsafe extern "system" fn h_gfs(h: P, hi: *mut u32) -> u32 {
 }
 
 /// Visit every 8-byte slot equal to `from` in the main module's data sections;
-/// replace it with `to` when `write` is set, otherwise only count.
+/// replace it with `to` when `write` is set, otherwise only count (and stop
+/// as soon as every `from` has been seen once).
 unsafe fn swap_imports(pairs: &[(usize, usize)], write: bool) -> Vec<usize> {
     let mut hits = vec![0usize; pairs.len()];
     let base = GetModuleHandleW(std::ptr::null()) as usize;
@@ -717,7 +830,7 @@ unsafe fn swap_imports(pairs: &[(usize, usize)], write: bool) -> Vec<usize> {
     let optsz = *((pe + 20) as *const u16) as usize;
     let sec0 = pe + 24 + optsz;
     let mut chunk = vec![0usize; SCAN_CHUNK / 8];
-    for i in 0..nsec {
+    'sections: for i in 0..nsec {
         let sh = sec0 + i * 40;
         let vsize = *((sh + 8) as *const u32) as usize;
         let va = *((sh + 12) as *const u32) as usize;
@@ -769,6 +882,9 @@ unsafe fn swap_imports(pairs: &[(usize, usize)], write: bool) -> Vec<usize> {
                         }
                     }
                     p += len;
+                    if !write && hits.iter().all(|n| *n > 0) {
+                        break 'sections;
+                    }
                 }
             }
             a = rend.max(a + 0x1000);
@@ -786,14 +902,21 @@ static TEST_PANIC_SCAN: AtomicBool = AtomicBool::new(false);
 static SUMMARY: AtomicBool = AtomicBool::new(false);
 
 unsafe fn k32(n: &[u8]) -> usize {
-    let k: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
-    GetProcAddress(GetModuleHandleW(k.as_ptr()), n.as_ptr()) as usize
+    static K: AtomicUsize = AtomicUsize::new(0);
+    let mut m = K.load(Ordering::Relaxed);
+    if m == 0 {
+        let k: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
+        m = GetModuleHandleW(k.as_ptr()) as usize;
+        K.store(m, Ordering::Relaxed);
+    }
+    GetProcAddress(m as P, n.as_ptr()) as usize
 }
 
 /// True once the game's import table holds the file APIs.
 unsafe fn imports_ready() -> bool {
-    let c = swap_imports(&[(k32(b"ReadFile\0"), 0), (k32(b"CreateFileW\0"), 0), (k32(b"CloseHandle\0"), 0)], false);
-    c.iter().all(|n| *n > 0)
+    static WANT: OnceLock<[(usize, usize); 3]> = OnceLock::new();
+    let want = WANT.get_or_init(|| [(k32(b"ReadFile\0"), 0), (k32(b"CreateFileW\0"), 0), (k32(b"CloseHandle\0"), 0)]);
+    swap_imports(want, false).iter().all(|n| *n > 0)
 }
 
 const HOOK_NAMES: [&str; 8] = ["ReadFile", "CloseHandle", "SetFilePointerEx", "SetFilePointer", "GetFileSizeEx", "GetFileSize", "CreateFileW", "CreateFileA"];
@@ -887,8 +1010,9 @@ unsafe fn early_file_hook() {
         if cur != last {
             last = cur;
             let (ws, commit) = process_memory();
+            let (distinct, held_mb, held_n) = vfs::recent_stats();
             note(&format!(
-                "status: packages={} ({} scanned, {} from cache, {} ms), upscalable textures={}, upscaled reads={} (RLE2 {}, RLES {}, LRLE {}; {} MB; avg {} us, slowest {} ms; recent results reused {} / upscaled anew {}), game memory {} MB in use / {} MB committed, HQ setting applied={}",
+                "status: packages={} ({} scanned, {} from cache, {} ms), upscalable textures={}, upscaled reads={} (RLE2 {}, RLES {}, LRLE {}, L8 {}; {} MB; avg {} us, slowest {} ms; recent results reused {} / upscaled anew {}, of those again after dropped {}, different textures {}, held {} MB in {}), game memory {} MB in use / {} MB committed, HQ setting applied={}",
                 cur.0,
                 N_PKG_SCANNED.load(Ordering::Relaxed),
                 N_PKG_CACHED.load(Ordering::Relaxed),
@@ -898,11 +1022,16 @@ unsafe fn early_file_hook() {
                 N_KIND[0].load(Ordering::Relaxed),
                 N_KIND[1].load(Ordering::Relaxed),
                 N_KIND[2].load(Ordering::Relaxed),
+                N_KIND[5].load(Ordering::Relaxed),
                 N_VBYTES.load(Ordering::Relaxed) >> 20,
                 UP_US.load(Ordering::Relaxed) / cur.1.max(1),
                 UP_MAX_US.load(Ordering::Relaxed) / 1000,
                 vfs::RECENT_HITS.load(Ordering::Relaxed),
                 vfs::RECENT_MISSES.load(Ordering::Relaxed),
+                vfs::RECENT_AGAIN.load(Ordering::Relaxed),
+                distinct,
+                held_mb,
+                held_n,
                 ws,
                 commit,
                 HQ_SEEN.load(Ordering::Relaxed)

@@ -264,9 +264,13 @@ pub fn inflate_sized(src: &[u8], limit: usize, expect: usize) -> Option<Vec<u8>>
                             let b = out[start];
                             out.resize(out.len() + len, b);
                         } else {
-                            for k in 0..len {
-                                let b = out[start + k];
-                                out.push(b);
+                            // Overlapping copy: the output from `start` on repeats with
+                            // period `dist`, so it can be extended by copying what is
+                            // already there in growing pieces instead of byte by byte.
+                            let end = out.len() + len;
+                            while out.len() < end {
+                                let n = (out.len() - start).min(end - out.len());
+                                out.extend_from_within(start..start + n);
                             }
                         }
                     }

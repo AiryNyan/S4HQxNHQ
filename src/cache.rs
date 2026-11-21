@@ -11,7 +11,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const MAGIC: &[u8; 4] = b"HQXC";
 /// Bump whenever the upscalers' output sizes change.
-const FORMAT: u32 = 4;
+const FORMAT: u32 = 5; // 5: pet / horse textures (landscape sizes, L8) are upscaled too
 
 /// Size limit of the cache file. Records of packages that have disappeared
 /// are dropped on every save; beyond the limit the least recently used

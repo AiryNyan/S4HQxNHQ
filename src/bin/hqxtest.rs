@@ -1,4 +1,6 @@
 //! Offline verification of the upscaler and package virtualization.
+#[path = "../bytes.rs"]
+mod bytes;
 #[path = "../inflate.rs"]
 mod inflate;
 #[path = "../lrle.rs"]
@@ -14,16 +16,20 @@ pub(crate) fn note(s: &str) {
 pub(crate) fn report(key: &str, ord: u32, size: u32) {
     println!("REPORT {key} entry {ord} size {size}");
 }
+pub(crate) fn lk<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 use std::io::{Read, Seek, SeekFrom};
 
-fn u16at(d: &[u8], o: usize) -> usize {
-    u16::from_le_bytes([d[o], d[o + 1]]) as usize
-}
+use bytes::u16at;
 
 /// Decode one mip to 5 bytes per pixel: R,G,B,A + the RLES extra plane.
 fn decode(d: &[u8], mip: usize) -> (usize, usize, Vec<u8>) {
     let h = rle::parse_hdr(d).unwrap();
+    if h.l8 {
+        return decode_l8(d, &h, mip);
+    }
     let bw = (((h.w >> mip).max(1)) + 3) / 4;
     let bh = (((h.h >> mip).max(1)) + 3) / 4;
     let (w, hh) = (bw * 4, bh * 4);
@@ -93,6 +99,40 @@ fn decode(d: &[u8], mip: usize) -> (usize, usize, Vec<u8>) {
     (w, hh, px)
 }
 
+/// L8 texture: one byte per pixel, stored as 5 bytes per pixel like `decode` (value in the first).
+fn decode_l8(d: &[u8], h: &rle::Hdr, mip: usize) -> (usize, usize, Vec<u8>) {
+    let bw = (((h.w >> mip).max(1)) + 3) / 4;
+    let bh = (((h.h >> mip).max(1)) + 3) / 4;
+    let (w, hh) = (bw * 4, bh * 4);
+    let mut px = vec![0u8; w * hh * 5];
+    let o = h.offs[mip];
+    let (mut dp, mut cc, mut pos) = (o[1], 0usize, 0usize);
+    while pos < bw * bh {
+        let cmd = u16at(d, o[0] + cc * 2);
+        cc += 1;
+        let (op, cnt) = (cmd & 3, cmd >> 2);
+        for b in pos..pos + cnt {
+            if op != 0 {
+                // op 1: 16 raw bytes; op 2: constant block without data (shown as 255)
+                let (bx, by) = (b % bw, b / bw);
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let p = ((by * 4 + y) * w + bx * 4 + x) * 5;
+                        px[p] = if op == 1 { d[dp + y * 4 + x] } else { 255 };
+                        px[p + 3] = 255;
+                        px[p + 4] = op as u8;
+                    }
+                }
+                if op == 1 {
+                    dp += 16;
+                }
+            }
+        }
+        pos += cnt;
+    }
+    (w, hh, px)
+}
+
 static mut BUCKET: [f64; 4] = [0.0; 4];
 static mut CNT: [usize; 4] = [0; 4];
 
@@ -132,14 +172,14 @@ fn main() {
     if std::env::var_os("HQX_DENSE").is_some() {
         vfs::FORCE_DENSE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let Some(pkg) = vfs::Pkg::build(path, "test", None, true) else {
+    let Ok(Some(pkg)) = vfs::Pkg::build(path, "test", None, true) else {
         println!("no sim textures / not parsable");
         return;
     };
     let k = |n: u8| pkg.ents.iter().filter(|e| e.kind == n).count();
     println!(
-        "scan: {} entries (RLE2 {}, RLES {}, LRLE {}, specular off {}), skipped {}, dense {}, watch {}, eof {} vend {}, {} ms",
-        pkg.ents.len(), k(0), k(1), k(2), k(4), pkg.skipped, pkg.dense, pkg.watch.len(), pkg.eof, pkg.vend, t0.elapsed().as_millis()
+        "scan: {} entries (RLE2 {}, RLES {}, LRLE {}, L8 {}, specular off {}), skipped {}, dense {}, watch {}, eof {} vend {}, {} ms",
+        pkg.ents.len(), k(0), k(1), k(2), k(5), k(4), pkg.skipped, pkg.dense, pkg.watch.len(), pkg.eof, pkg.vend, t0.elapsed().as_millis()
     );
     if pkg.ents.is_empty() {
         return;
@@ -182,13 +222,13 @@ fn main() {
     }
     // A rebuild from the cached plan must give the same layout.
     let t1 = std::time::Instant::now();
-    let again = vfs::Pkg::build(path, "test", Some(&pkg.plan), false).expect("build from cache");
+    let again = vfs::Pkg::build(path, "test", Some(&pkg.plan), false).ok().flatten().expect("build from cache");
     assert!(again.patches == pkg.patches && again.vend == pkg.vend && again.ents.len() == pkg.ents.len(), "cached build differs");
     println!("rebuild from cached plan: identical, {} us", t1.elapsed().as_micros());
     let mut f = std::fs::File::open(path).unwrap();
     let sel: Vec<usize> = (0..pkg.ents.len()).filter(|i| only.map_or(true, |o| pkg.ents[*i].kind == o)).collect();
     let step = (sel.len() / count).max(1);
-    let (mut ok, mut up_us, mut slack) = ([0usize; 3], [0u128; 3], 0usize);
+    let (mut ok, mut up_us, mut slack) = ([0usize; 6], [0u128; 6], 0usize);
     let (mut max_ratio, mut unfit, mut max_bound) = (0f64, 0, 0usize);
     let mut adler_ok = 0usize;
     let mut refit_ok = 0usize;
@@ -233,7 +273,7 @@ fn main() {
             }
             up
         } else {
-            rle::upscale(&full).expect("upscale")
+            rle::upscale(&full).unwrap_or_else(|| panic!("upscale failed: entry {i} kind {} header {:02x?}", e.kind, &full[..16]))
         };
         up_us[e.kind as usize] += t.elapsed().as_micros();
         assert_eq!(up.len(), e.size as usize);
@@ -301,13 +341,63 @@ fn main() {
         ok[e.kind as usize] += 1;
     }
     let avg = |k: usize| if ok[k] > 0 { up_us[k] / ok[k] as u128 } else { 0 };
-    println!("verified pixel-exact 2x: RLE2 {} (avg {} us), RLES {} (avg {} us), LRLE {} (avg {} us)", ok[0], avg(0), ok[1], avg(1), ok[2], avg(2));
+    println!("verified pixel-exact 2x: RLE2 {} (avg {} us), RLES {} (avg {} us), LRLE {} (avg {} us), L8 {} (avg {} us)", ok[0], avg(0), ok[1], avg(1), ok[2], avg(2), ok[5], avg(5));
     if blank_ok > 0 {
         println!("specular served empty, verified: {blank_ok}");
     }
-    println!("LRLE: max top-level growth x{max_ratio:.2}, did not fit: {unfit}; largest served entry {} KB; RLE avg padding {} bytes", max_bound >> 10, slack / (ok[0] + ok[1]).max(1));
+    println!("LRLE: max top-level growth x{max_ratio:.2}, did not fit: {unfit}; largest served entry {} KB; RLE avg padding {} bytes", max_bound >> 10, slack / (ok[0] + ok[1] + ok[5]).max(1));
     println!("inflate checksum verified on {adler_ok} textures; LRLE overflow-and-refit verified on {refit_ok}");
     unsafe { println!("LRLE growth by top-level size (<4K, <64K, <512K, larger): {:.2?} counts {:?}", BUCKET, CNT); }
+    // transparent stand-ins (served when an upscale fails) must be valid, fully transparent textures
+    for (magic, w, h, mips) in [(b"DXT5RLE2", 2048usize, 4096usize, 13usize), (b"DXT5RLES", 1024, 2048, 12), (b"L8  RLE2", 4096, 2048, 10)] {
+        let t = rle::transparent(magic, w, h, mips, 4 << 20).expect("transparent rle");
+        let hh = rle::parse_hdr(&t).expect("transparent rle header");
+        assert!(hh.w == w && hh.h == h && hh.mips == mips && hh.bound(t.len()).is_some(), "transparent rle header");
+        for m in 0..mips {
+            assert!(decode(&t, m).2.chunks(5).all(|p| p[3] == 0), "transparent rle mip {m}");
+        }
+    }
+    let t = lrle::transparent(2048, 4096, 9, 4 << 20).expect("transparent lrle");
+    for m in 0..9 {
+        assert!(lrle::decode(&t, m).expect("transparent lrle decode").2.iter().all(|p| *p == 0), "transparent lrle mip {m}");
+    }
+    println!("transparent stand-ins: valid");
+    // one read covering two neighbouring virtual entries gets both
+    if !pkg.dense && pkg.ents.len() >= 2 {
+        let (a, b) = (&pkg.ents[0], &pkg.ents[1]);
+        let mut both = vec![0u8; (a.size + b.size) as usize];
+        let n = pkg.read_virtual(a.voff, &mut both, &mut None).0;
+        let (mut x, mut y) = (vec![0u8; a.size as usize], vec![0u8; b.size as usize]);
+        pkg.read_virtual(a.voff, &mut x, &mut None);
+        pkg.read_virtual(b.voff, &mut y, &mut None);
+        assert!(n == both.len() && both[..x.len()] == x[..] && both[x.len()..] == y[..], "read across entries");
+        println!("read across two neighbouring entries: identical");
+    }
+    // several threads producing different entries at once (first time: the
+    // package file is then also read through handles of their own) must give
+    // the same bytes as reading them one by one
+    {
+        let pick: Vec<usize> = (0..pkg.ents.len()).rev().step_by((pkg.ents.len() / 24).max(1)).take(24).collect();
+        let pkg_ref = &pkg;
+        let together: Vec<Vec<u8>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = pick.iter().map(|&i| sc.spawn(move || {
+                let mut v = vec![0u8; pkg_ref.ents[i].size as usize];
+                pkg_ref.read_virtual(pkg_ref.ents[i].voff, &mut v, &mut None);
+                v
+            })).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        // the same entries one by one from a second scan of the package (a
+        // different Pkg, so nothing comes from the results kept for the first)
+        let pkg2 = vfs::Pkg::build(path, "test2", Some(&pkg.plan), false).ok().flatten().expect("second scan");
+        let alone: Vec<Vec<u8>> = pick.iter().map(|&i| {
+            let mut v = vec![0u8; pkg2.ents[i].size as usize];
+            pkg2.read_virtual(pkg2.ents[i].voff, &mut v, &mut None);
+            v
+        }).collect();
+        assert!(alone == together, "concurrent reads differ");
+        println!("concurrent reads of {} entries: identical", pick.len());
+    }
     let mut whole = vec![0u8; pkg.idx_len];
     f.seek(SeekFrom::Start(pkg.idx_pos)).unwrap();
     f.read_exact(&mut whole).unwrap();

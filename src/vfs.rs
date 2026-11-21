@@ -4,14 +4,15 @@
 //! point past the real end of file ("virtual region"); reads there are served
 //! from textures upscaled on demand.
 
+use crate::bytes::u32le as u32at;
 use crate::inflate::inflate;
-use crate::{lrle, rle};
+use crate::{lk, lrle, rle};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 pub const T_RLE2: u32 = 0x3453_CF95;
 pub const T_RLES: u32 = 0xBA85_6C78;
@@ -43,7 +44,7 @@ pub struct VEntry {
     pub fsize: u32,
     pub msize: u32,
     pub comp: u16,
-    /// 0 = RLE2, 1 = RLES, 2 = LRLE, 4 = specular served empty (see `specular_off`)
+    /// 0 = RLE2, 1 = RLES, 2 = LRLE, 4 = specular served empty (see `specular_off`), 5 = L8 (pets)
     pub kind: u8,
     /// Position in the package index.
     pub ord: u32,
@@ -83,25 +84,31 @@ pub struct Pkg {
     /// The bypass warning for this package was logged.
     pub warned: std::sync::atomic::AtomicBool,
     path: std::path::PathBuf,
-    /// Opened on the first upscale from this package, then kept.
+    /// Opened on the first upscale from this package, then kept. A thread
+    /// that finds it in use opens a handle of its own for that read instead
+    /// of waiting (Windows runs the reads of one handle one after another).
     file: Mutex<Option<File>>,
 }
 
-/// Recently upscaled textures of all packages together, oldest first, with
-/// their total size. Serves reads that fetch one texture in several calls;
-/// bounded so it cannot grow with the number of packages.
+/// Recently upscaled textures of all packages together, least recently used
+/// first, with their total size. The game reads the same textures again and
+/// again (outfit changes, sims coming into view, CAS), so keeping results
+/// saves upscaling them anew; bounded so it cannot grow without limit.
 static RECENT: Mutex<(VecDeque<(usize, usize, Arc<Vec<u8>>)>, usize)> = Mutex::new((VecDeque::new(), 0));
-const RECENT_MAX: usize = 48 << 20;
+const RECENT_MAX: usize = 1 << 30;
 /// Upscaled textures served from RECENT / produced anew (status log).
 pub static RECENT_HITS: AtomicU64 = AtomicU64::new(0);
 pub static RECENT_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Of the textures produced anew: how many had been produced before in this
+/// session (dropped from RECENT in between), and how many different ones.
+pub static RECENT_AGAIN: AtomicU64 = AtomicU64::new(0);
+static SEEN: Mutex<Option<std::collections::HashSet<(usize, usize)>>> = Mutex::new(None);
 
-fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn u32at(d: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+/// (different textures upscaled this session, MB held in RECENT, textures held)
+pub fn recent_stats() -> (usize, usize, usize) {
+    let distinct = lk(&SEEN).as_ref().map_or(0, |s| s.len());
+    let c = lk(&RECENT);
+    (distinct, c.1 >> 20, c.0.len())
 }
 
 fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
@@ -117,6 +124,22 @@ fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
     }
     v.truncate(got);
     Some(v)
+}
+
+/// A package file being scanned. Remembers whether any read failed, so a
+/// scan that could not see everything is not mistaken for (and cached as)
+/// "nothing to upscale".
+struct Reader {
+    f: File,
+    failed: bool,
+}
+
+impl Reader {
+    fn at(&mut self, off: u64, len: usize) -> Option<Vec<u8>> {
+        let r = read_at(&mut self.f, off, len);
+        self.failed |= r.is_none();
+        r
+    }
 }
 
 /// TGI of a CAS part reference: (type, instance high, instance low).
@@ -141,17 +164,36 @@ fn casp_refs(c: &[u8]) -> Option<(Vec<Key>, usize, usize, usize)> {
     // Before the TGI list: diffuse, shadow, composition, region map,
     // override count, overrides (5 bytes each), normal, specular,
     // UV body type (u32), emission, one more byte.
+    // The override count is found by trying every count that fits. Bytes of
+    // a real override (region, f32 layer) can look like a smaller count, so
+    // every count that gives plausible fields is collected; when they
+    // disagree on the maps the part is left alone.
+    let mut found: Option<(usize, usize, usize)> = None;
     for nov in 0..16usize {
         let Some(s) = base.checked_sub(13 + 5 * nov) else { break };
         if c[s + 4] as usize != nov {
             continue;
         }
         let (d, sh, nm, sp) = (c[s] as usize, c[s + 1] as usize, c[s + 5 + 5 * nov] as usize, c[s + 6 + 5 * nov] as usize);
-        if d < n && sh < n && nm < n && sp < n {
-            return Some((tgis, d, sh, sp));
+        if !(d < n && sh < n && nm < n && sp < n) {
+            continue;
+        }
+        let overrides_ok = (0..nov).all(|k| {
+            let o = s + 5 + 5 * k;
+            let layer = f32::from_le_bytes([c[o + 1], c[o + 2], c[o + 3], c[o + 4]]);
+            c[o] < 64 && layer.is_finite() && (layer == 0.0 || (1e-6..=1e6).contains(&layer.abs()))
+        });
+        if !overrides_ok {
+            continue;
+        }
+        match found {
+            None => found = Some((d, sh, sp)),
+            Some(f) if f == (d, sh, sp) => {}
+            Some(_) => return None, // ambiguous: do not guess
         }
     }
-    None
+    let (d, sh, sp) = found?;
+    Some((tgis, d, sh, sp))
 }
 
 /// Index entries of specular maps (RLES) to serve with no specular: those of
@@ -160,7 +202,7 @@ fn casp_refs(c: &[u8]) -> Option<(Vec<Key>, usize, usize, usize)> {
 /// specular map at full strength (seen as plastic-like shine: RUSTY Jalynne
 /// Jogger Pants), while without HQ the part looks matte. A specular map also
 /// used by a part that has a shadow map is left alone.
-fn specular_off(f: &mut File, n: usize, key: &dyn Fn(usize) -> Key, fields: &dyn Fn(usize) -> (usize, u64, u32, u32, u16), eof: u64) -> std::collections::HashSet<u32> {
+fn specular_off(f: &mut Reader, n: usize, key: &dyn Fn(usize) -> Key, fields: &dyn Fn(usize) -> (usize, u64, u32, u32, u16), eof: u64) -> std::collections::HashSet<u32> {
     use std::collections::{HashMap, HashSet};
     let mut off = HashSet::new();
     let casps: Vec<usize> = (0..n).filter(|&i| key(i).0 == T_CASP).collect();
@@ -171,10 +213,12 @@ fn specular_off(f: &mut File, n: usize, key: &dyn Fn(usize) -> Key, fields: &dyn
     let mut read = |i: usize, all: bool| -> Option<Vec<u8>> {
         let (_, o, fs, ms, comp) = fields(i);
         let fs = (fs & 0x7FFF_FFFF) as usize;
-        if o + fs as u64 > eof || ms as usize > 1 << 20 {
+        // The size cap is for whole reads (CAS part definitions); a texture
+        // header peek reads at most 2 KB whatever the texture's size.
+        if o + fs as u64 > eof || (all && ms as usize > 1 << 20) {
             return None;
         }
-        let raw = read_at(f, o, if all { fs } else { fs.min(2048) })?;
+        let raw = f.at(o, if all { fs } else { fs.min(2048) })?;
         match comp {
             ZLIB => inflate(&raw, if all { ms as usize } else { 16 }),
             0 => Some(raw),
@@ -221,7 +265,7 @@ fn plan(head: &[u8], msize: usize) -> Option<(usize, u8)> {
         if !h.needs_upscale() {
             return None;
         }
-        Some((h.bound(msize)?, h.spec as u8))
+        Some((h.bound(msize)?, if h.l8 { 5 } else { h.spec as u8 }))
     }
 }
 
@@ -229,14 +273,15 @@ fn plan(head: &[u8], msize: usize) -> Option<(usize, u8)> {
 pub fn describe(ty: u32, data: &[u8], comp: u16) -> String {
     let head = if comp == ZLIB { inflate(data, 160).unwrap_or_default() } else { data[..data.len().min(160)].to_vec() };
     let u16at = |o: usize| u16::from_le_bytes([head[o], head[o + 1]]);
-    if head.len() >= 16 && &head[0..4] == b"DXT5" {
-        let (kind, w, h) = (String::from_utf8_lossy(&head[4..8]).into_owned(), u16at(8), u16at(10));
-        let hq = (kind == "RLE2" && (w, h) == (2048, 4096)) || (kind == "RLES" && (w, h) == (1024, 2048));
+    if head.len() >= 16 && (&head[0..4] == b"DXT5" || &head[0..8] == b"L8  RLE2") {
+        let (kind, w, h) = (String::from_utf8_lossy(&head[0..8]).replace("DXT5", "").replace("  ", " "), u16at(8), u16at(10));
+        let big = |(a, b): (u16, u16)| (w, h) == (a, b) || (w, h) == (b, a);
+        let hq = if kind == "RLES" { big((1024, 2048)) } else { big((2048, 4096)) };
         return format!("{}{kind} {w}x{h}", if hq { "HQ " } else { "" });
     }
     if head.len() >= 16 && &head[0..4] == b"LRLE" {
         let (w, h) = (u16at(8), u16at(10));
-        return format!("{}LRLE{} {w}x{h}", if (w, h) == (2048, 4096) { "HQ " } else { "" }, if head[4] == 0 { "v1" } else { "v2" });
+        return format!("{}LRLE{} {w}x{h}", if (w, h) == (2048, 4096) || (w, h) == (4096, 2048) { "HQ " } else { "" }, if head[4] == 0 { "v1" } else { "v2" });
     }
     if head.len() >= 88 && &head[0..4] == b"DDS " {
         let (h, w) = (u32at(&head, 12), u32at(&head, 16));
@@ -257,10 +302,27 @@ impl Pkg {
     /// `cached`: the result of an earlier scan of the same file; texture
     /// headers are then not read again. `want_watch`: also list the sim
     /// textures that are not upscaled (debug mode).
-    pub fn build(path: &Path, key: &str, cached: Option<&[Planned]>, want_watch: bool) -> Option<Pkg> {
-        let mut f = File::open(path).ok()?;
-        let eof = f.metadata().ok()?.len();
-        let h = read_at(&mut f, 0, 96)?;
+    ///
+    /// Err: the file could not be opened or read completely (it may be locked
+    /// for a moment); the result says nothing about its content and must
+    /// not be remembered.
+    pub fn build(path: &Path, key: &str, cached: Option<&[Planned]>, want_watch: bool) -> Result<Option<Pkg>, String> {
+        let f = File::open(path).map_err(|e| format!("cannot open ({e})"))?;
+        let mut r = Reader { f, failed: false };
+        let p = Self::build_from(&mut r, path, key, cached, want_watch);
+        if r.failed {
+            return Err("read error".into());
+        }
+        Ok(p)
+    }
+
+    fn build_from(f: &mut Reader, path: &Path, key: &str, cached: Option<&[Planned]>, want_watch: bool) -> Option<Pkg> {
+        let Ok(meta) = f.f.metadata() else {
+            f.failed = true;
+            return None;
+        };
+        let eof = meta.len();
+        let h = f.at(0, 96)?;
         if h.len() < 96 || &h[0..4] != b"DBPF" || u32at(&h, 4) != 2 {
             return None;
         }
@@ -273,7 +335,7 @@ impl Pkg {
         if n == 0 || idx_pos == 0 || idx_pos + idx_size as u64 > eof {
             return None;
         }
-        let idx = read_at(&mut f, idx_pos, idx_size)?;
+        let idx = f.at(idx_pos, idx_size)?;
         if idx.len() < 4 {
             return None;
         }
@@ -313,7 +375,7 @@ impl Pkg {
         let level = LEVEL.load(Ordering::Relaxed);
         if let Some(list) = cached {
             for &(ord, bound, kind) in list {
-                if ord as usize >= n || !matches!(kind, 0 | 1 | 2 | 4) || bound as usize > MAX_BOUND {
+                if ord as usize >= n || !matches!(kind, 0 | 1 | 2 | 4 | 5) || bound as usize > MAX_BOUND {
                     return None; // cache does not match this file
                 }
                 let (p, off, fs_raw, msize, comp) = fields(ord as usize);
@@ -346,29 +408,42 @@ impl Pkg {
                 }
                 (v[0], v[2], v[3])
             };
-            let spec_off = specular_off(&mut f, n, &key, &fields, eof);
+            // First every texture header: what to upscale, and which entries
+            // are HQ-size specular maps (RLES 1024x2048) that the specular
+            // rule could blank. (index entry, type, plan, blank size)
+            let mut seen: Vec<(usize, u32, Option<(usize, u8)>, Option<usize>)> = Vec::new();
             for i in 0..n {
                 let ty = konst[0].unwrap_or_else(|| u32at(&idx, o + i * esize));
                 if !is_tex(ty) {
                     continue;
                 }
-                let (p, off, fs_raw, msize, comp) = fields(i);
+                let (_, off, fs_raw, msize, comp) = fields(i);
                 let fsize = fs_raw & 0x7FFF_FFFF;
                 if !usable(off, fsize, comp) {
                     continue;
                 }
-                let mut planned = None;
+                let (mut planned, mut blank) = (None, None);
                 if ty != T_DDS {
                     // Peek at the texture header only.
                     let need = rle::hdr_len(true, 16).max(lrle::PEEK);
-                    if let Some(raw) = read_at(&mut f, off, (fsize as usize).min(2048)) {
+                    if let Some(raw) = f.at(off, (fsize as usize).min(2048)) {
                         let head = if comp == ZLIB { inflate(&raw, need) } else { Some(raw) };
                         planned = head.as_deref().and_then(|h| plan(h, msize as usize)).filter(|p| !(p.1 == 2 && level >= 2));
-                        if planned.is_none() && spec_off.contains(&(i as u32)) {
-                            planned = head.as_deref().filter(|h| h.starts_with(b"DXT5RLES")).and_then(|h| rle::blank_len(h, msize as usize)).map(|n| (n, 4));
+                        if planned.is_none() {
+                            blank = head.as_deref().and_then(|h| rle::parse_hdr(h).filter(|r| r.spec && (r.w, r.h) == (1024, 2048)).and_then(|_| rle::blank_len(h, msize as usize)));
                         }
                     }
                 }
+                seen.push((i, ty, planned, blank));
+            }
+            // The specular rule reads every CAS part definition: only worth it
+            // when the package holds a specular map it could apply to (none of
+            // the game's own packages do).
+            let spec_off = if seen.iter().any(|s| s.3.is_some()) { specular_off(f, n, &key, &fields, eof) } else { Default::default() };
+            for (i, ty, planned, blank) in seen {
+                let (p, off, fs_raw, msize, comp) = fields(i);
+                let fsize = fs_raw & 0x7FFF_FFFF;
+                let planned = planned.or_else(|| blank.filter(|_| spec_off.contains(&(i as u32))).map(|n| (n, 4)));
                 match planned {
                     Some((bound, kind)) if bound <= MAX_BOUND => cand.push((p, fs_raw, VEntry { voff: 0, size: bound as u32, off, fsize, msize, comp, kind, ord: i as u32 })),
                     _ if want_watch => watch.push((off, ty, comp)),
@@ -420,7 +495,6 @@ impl Pkg {
         patches.sort_unstable_by_key(|p| p.0);
         let mut real_offs: Vec<u64> = ents.iter().map(|e| e.off).collect();
         real_offs.sort_unstable();
-        drop(f); // most packages are never read from by the upscaler
         let vend = if ents.is_empty() {
             eof
         } else if dense {
@@ -485,19 +559,34 @@ impl Pkg {
 
     fn produce(&self, i: usize) -> Arc<Vec<u8>> {
         let id = self as *const Pkg as usize;
-        if let Some((_, _, v)) = lk(&RECENT).0.iter().find(|(p, k, _)| *p == id && *k == i) {
-            RECENT_HITS.fetch_add(1, Ordering::Relaxed);
-            return v.clone();
+        {
+            let mut c = lk(&RECENT);
+            if let Some(pos) = c.0.iter().rposition(|(p, k, _)| *p == id && *k == i) {
+                // used again: move to the most recently used end
+                let hit = c.0.remove(pos).expect("position found above");
+                let v = hit.2.clone();
+                c.0.push_back(hit);
+                RECENT_HITS.fetch_add(1, Ordering::Relaxed);
+                return v;
+            }
         }
         RECENT_MISSES.fetch_add(1, Ordering::Relaxed);
+        if !lk(&SEEN).get_or_insert_with(Default::default).insert((id, i)) {
+            RECENT_AGAIN.fetch_add(1, Ordering::Relaxed);
+        }
         let e = &self.ents[i];
+        let mut head: Option<Vec<u8>> = None;
+        let mut size_wrong = false;
         let data = (|| {
-            let raw = {
-                let mut g = lk(&self.file);
-                if g.is_none() {
-                    *g = Some(File::open(&self.path).ok()?);
+            let raw = match self.file.try_lock() {
+                Ok(mut g) => {
+                    if g.is_none() {
+                        *g = Some(File::open(&self.path).ok()?);
+                    }
+                    read_at(g.as_mut()?, e.off, e.fsize as usize)?
                 }
-                read_at(g.as_mut()?, e.off, e.fsize as usize)?
+                // in use by another thread (or poisoned): read through a handle of our own
+                Err(_) => read_at(&mut File::open(&self.path).ok()?, e.off, e.fsize as usize)?,
             };
             // Stop at the size the index promises: a damaged stream must not
             // grow without limit (running out of memory ends the game).
@@ -505,6 +594,7 @@ impl Pkg {
             if full.len() != e.msize as usize {
                 return None;
             }
+            head = Some(full[..full.len().min(512)].to_vec());
             let up = if e.kind == 4 {
                 rle::blank(&full)?
             } else if e.kind == 2 {
@@ -517,15 +607,25 @@ impl Pkg {
             } else {
                 rle::upscale(&full)?
             };
-            (up.len() == e.size as usize).then_some(up)
+            size_wrong = up.len() != e.size as usize;
+            (!size_wrong).then_some(up)
         })();
-        let ok = data.is_some();
-        let v = Arc::new(data.unwrap_or_else(|| vec![0u8; e.size as usize]));
-        if !ok {
-            crate::note(&format!("UPSCALE FAILED {} entry {} kind={} off={}", self.name, e.ord, e.kind, e.off));
-            crate::report(&self.key, e.ord, 0);
-        }
+        let v = Arc::new(match data {
+            Some(v) => v,
+            None => {
+                crate::note(&format!("UPSCALE FAILED {} entry {} kind={} off={}, served transparent", self.name, e.ord, e.kind, e.off));
+                if size_wrong {
+                    // The remembered size no longer matches: scan the package again next start.
+                    crate::report(&self.key, e.ord, 0);
+                }
+                // A read error or damaged data: the record stays, so the next start simply tries again.
+                fallback(e, head.as_deref())
+            }
+        });
         let mut c = lk(&RECENT);
+        if let Some((_, _, w)) = c.0.iter().rev().find(|(p, k, _)| *p == id && *k == i) {
+            return w.clone(); // another thread finished the same texture first: keep one copy
+        }
         c.1 += v.len();
         c.0.push_back((id, i, v.clone()));
         while c.1 > RECENT_MAX && c.0.len() > 1 {
@@ -561,16 +661,75 @@ impl Pkg {
                 }
             },
         };
-        let e = &self.ents[i];
-        if within >= e.size as usize {
+        if within >= self.ents[i].size as usize {
             return (0, 3);
         }
-        let n = (e.size as usize - within).min(buf.len());
-        let data = self.produce(i);
-        buf[..n].copy_from_slice(&data[within..within + n]);
-        if within + n < e.size as usize {
-            *cont = Some((i, pos + n as u64, within + n));
+        let (mut i, mut within, mut done, mut kind) = (i, within, 0usize, 3u8);
+        loop {
+            let e = &self.ents[i];
+            let n = (e.size as usize - within).min(buf.len() - done);
+            let data = self.produce(i);
+            buf[done..done + n].copy_from_slice(&data[within..within + n]);
+            if kind == 3 {
+                kind = e.kind;
+            }
+            done += n;
+            if within + n < e.size as usize {
+                *cont = Some((i, pos + done as u64, within + n));
+                break;
+            }
+            // A read that goes on past this entry continues into the next one
+            // when they are laid out back to back (never in dense mode, where
+            // entries overlap).
+            let next = e.voff + e.size as u64;
+            if done == buf.len() || self.dense || i + 1 >= self.ents.len() || self.ents[i + 1].voff != next {
+                break;
+            }
+            i += 1;
+            within = 0;
         }
-        (n, e.kind)
+        (done, kind)
     }
+}
+
+/// Number of mip levels of a full chain down to 1 pixel on the long side
+/// (what the game's RLE2/RLES sim textures carry: 12 levels at 1024x2048).
+fn chain(w: usize, h: usize) -> usize {
+    ((usize::BITS - w.max(h).max(1).leading_zeros()) as usize).min(16)
+}
+
+/// Mip levels of the game's LRLE sim textures (1024x2048 down to 4x8),
+/// kept by the upscale.
+const LRLE_MIPS: usize = 9;
+
+/// What to serve when an upscale failed: a valid, fully transparent texture
+/// of the planned size, shaped like the upscale would have been (taken from
+/// the source header when it could be read).
+fn fallback(e: &VEntry, head: Option<&[u8]>) -> Vec<u8> {
+    let size = e.size as usize;
+    let t = match e.kind {
+        2 => {
+            let (w, h, m) = head.and_then(lrle::parse_hdr).map_or((2048, 4096, LRLE_MIPS), |h| (h.w * 2, h.h * 2, h.mips));
+            lrle::transparent(w, h, m, size)
+        }
+        4 => {
+            let (w, h, m) = head.and_then(rle::parse_hdr).map_or((1024, 2048, chain(1024, 2048)), |h| (h.w, h.h, h.mips));
+            rle::transparent(b"DXT5RLES", w, h, m, size)
+        }
+        k => {
+            let magic: &[u8; 8] = match k {
+                1 => b"DXT5RLES",
+                5 => b"L8  RLE2",
+                _ => b"DXT5RLE2",
+            };
+            let (w0, h0) = match k {
+                1 => (512, 1024),
+                5 => (2048, 1024),
+                _ => (1024, 2048),
+            };
+            let (w, h, m) = head.and_then(rle::parse_hdr).map_or((w0 * 2, h0 * 2, chain(w0 * 2, h0 * 2)), |h| (h.w * 2, h.h * 2, (h.mips + 1).min(16)));
+            rle::transparent(magic, w, h, m, size)
+        }
+    };
+    t.unwrap_or_else(|| vec![0u8; size])
 }

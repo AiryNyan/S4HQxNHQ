@@ -73,7 +73,8 @@ fn main() {
                     assert_eq!((fs, comp), (ms, 0));
                     let (tw, th, mips) = (u16::from_le_bytes([d[8], d[9]]), u16::from_le_bytes([d[10], d[11]]), u16::from_le_bytes([d[12], d[13]]));
                     println!("  virtual entry off={off} size={fs}: {} {} {tw}x{th} mips={mips}", String::from_utf8_lossy(&d[0..4]), String::from_utf8_lossy(&d[4..8]));
-                    assert!((tw, th) == (2048, 4096) || (tw, th) == (1024, 2048));
+                    // sims portrait, pets and horses landscape
+                    assert!([(2048, 4096), (1024, 2048), (4096, 2048), (2048, 1024)].contains(&(tw, th)), "unexpected size {tw}x{th}");
                     if let (Some(out), true) = (std::env::var_os("HQX_DUMP"), d.starts_with(b"DXT5RLES")) {
                         std::fs::write(out, &d).unwrap();
                     }
@@ -90,6 +91,15 @@ fn main() {
                     b.truncate(got as usize);
                     a.extend_from_slice(&b);
                     assert!(a == d, "split read with a position query differs");
+                    // in chunks, with an absolute seek to each chunk (must not end the read)
+                    let mut c = Vec::new();
+                    let mut p = 0usize;
+                    while p < fs as usize {
+                        let k = 65536.min(fs as usize - p);
+                        c.extend_from_slice(&rd(h, off + p as u64, k));
+                        p += k;
+                    }
+                    assert!(c == d, "chunked read with absolute seeks differs (entry at {off})");
                     checked += 1;
                 }
             }

@@ -22,12 +22,7 @@ pub struct Hdr {
     pub base: usize,
 }
 
-fn u16at(d: &[u8], o: usize) -> usize {
-    u16::from_le_bytes([d[o], d[o + 1]]) as usize
-}
-fn u32at(d: &[u8], o: usize) -> usize {
-    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]]) as usize
-}
+use crate::bytes::{u16at, u32at};
 
 pub fn parse_hdr(d: &[u8]) -> Option<Hdr> {
     if d.len() < 16 || &d[0..4] != b"LRLE" {
@@ -58,8 +53,9 @@ pub fn parse_hdr(d: &[u8]) -> Option<Hdr> {
 }
 
 impl Hdr {
+    /// Sims are portrait (1024x2048), pets and horses landscape (2048x1024).
     pub fn needs_upscale(&self) -> bool {
-        self.w == 1024 && self.h == 2048 && self.mips >= 2
+        ((self.w, self.h) == (1024, 2048) || (self.w, self.h) == (2048, 1024)) && self.mips >= 2
     }
     fn sane(&self, total: usize) -> bool {
         if self.w % 4 != 0 || self.h % 4 != 0 || self.mips < 2 || self.base > total || self.offs[0] != 0 {
@@ -494,6 +490,38 @@ pub fn upscale(d: &[u8], size: Option<usize>) -> Option<(Vec<u8>, Option<usize>)
     // Padding lands in the last mip: use zero-length literal runs, which decode to nothing.
     out.resize(bound, if h.v2 { 3 } else { 1 });
     Some((out, (!fits).then_some(needed)))
+}
+
+/// A valid, fully transparent LRLE (version 0) of the given size and mip
+/// count: one transparent run per level. Served in place of an upscale that
+/// failed. Padded with zero-length literals to `size`.
+pub fn transparent(w: usize, h: usize, mips: usize, size: usize) -> Option<Vec<u8>> {
+    if mips == 0 || mips > 16 || w == 0 || h == 0 {
+        return None;
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut offs = Vec::with_capacity(mips);
+    for i in 0..mips {
+        offs.push(body.len());
+        let mut e = Enc { v2: false, out: Vec::new(), lit: Vec::new(), cur: 0, len: 0 };
+        e.repeat(0, (w >> i).max(1) * (h >> i).max(1));
+        body.extend_from_slice(&e.out);
+    }
+    let base = 16 + 4 * mips;
+    if base + body.len() > size {
+        return None;
+    }
+    let mut out = Vec::with_capacity(size);
+    out.extend_from_slice(b"LRLE\0\0\0\0");
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.extend_from_slice(&(mips as u32).to_le_bytes());
+    for o in offs {
+        out.extend_from_slice(&(o as u32).to_le_bytes());
+    }
+    out.extend_from_slice(&body);
+    out.resize(size, 1);
+    Some(out)
 }
 
 /// Decode one mip to pixels in raster order (verification only).

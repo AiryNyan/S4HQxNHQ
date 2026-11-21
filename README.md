@@ -69,9 +69,19 @@ S4HQxNHQ는 게임이 텍스처를 **읽는 순간에** 끼어듭니다.
 ## 7. 확인된 문제점
 
 - 캐시가 없는 첫 로딩 때는 로딩 시간이 이전보다 늘어납니다.
-- CC 제작자마다 제작 방식이 달라서, non-HQ CC를 변환하는 과정에서 텍스처가 깨질 수 있습니다.
-  
+- CC 제작자마다 제작 방식이 달라서, non-HQ CC를 변환하는 과정에서 텍스처가 깨질 수 있습니다.<br>
   이런 경우 이슈나 메일 <admin@fairy09.com> 로 어느 CC인지 알려 주시면 확인해 보겠습니다.
+
+- 샌미슈노처럼 부지 바로 옆에 공원이 있어서 동네 심이 자주 나타나는 부지에서는 끊김이 생길수 있습니다.<br>
+해당 심들도 작업 대상에 들어갈수밖에 없어서 더 끊김이 발생하기에 아래 모드 사용을 추천합니다.
+
+| 모드 | 효과 | 링크 |
+|---|---|---|
+| Less Walkbys – Modular/All Worlds | 동네 심 약 90% 감소 | [CurseForge](https://www.curseforge.com/sims4/mods/less-walkbys) |
+| No Walkbys – Modular/All Worlds | 동네 심 완전 제거 | [CurseForge](https://www.curseforge.com/sims4/mods/no-walkbys) |
+
+해당 모드 모두 마을별로 파일이 나뉘져있어 플레이하는 마을만 적용하시면 됩니다
+
 <br><br>
 ---------------------------------------
 ---------------------------------------
@@ -148,6 +158,15 @@ When the mod is working, the following files appear in the `Game\Bin` folder aft
 ## 7. Known issues
 
 - The first load without a cache takes longer than before.
-- Because every CC creator builds their items differently, some non-HQ CC may show broken textures after conversion.
+- Because every CC creator builds their content differently, textures may break when converting non-HQ CC.<br>
+  If this happens, please let us know which CC is affected by opening an issue or emailing <admin@fairy09.com>, and we'll look into it.
 
-  If this happens, please let me know which CC it is through an issue or by email at <admin@fairy09.com>, and I'll take a look.
+- On lots with a park right next to them, like those in San Myshuno, neighborhood Sims show up often and you may experience stuttering.<br>
+  These Sims have to be processed as well, which adds to the stuttering, so we recommend using one of the mods below.
+
+| Mod | Effect | Link |
+|---|---|---|
+| Less Walkbys – Modular/All Worlds | Reduces walkby Sims by about 90% | [CurseForge](https://www.curseforge.com/sims4/mods/less-walkbys) |
+| No Walkbys – Modular/All Worlds | Removes walkby Sims completely | [CurseForge](https://www.curseforge.com/sims4/mods/no-walkbys) |
+
+Both mods split their files by world, so you only need to install the files for the worlds you play in.

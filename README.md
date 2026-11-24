@@ -82,6 +82,44 @@ S4HQxNHQ는 게임이 텍스처를 **읽는 순간에** 끼어듭니다.
 
 해당 모드 모두 마을별로 파일이 나뉘져있어 플레이하는 마을만 적용하시면 됩니다
 
+## 8. 라이선스
+
+S4HQxNHQ는 텍스처 압축 해제에 아래 오픈소스를 사용합니다.
+
+| 이름 | 용도 | 라이선스 |
+|---|---|---|
+| [libdeflate](https://github.com/ebiggers/libdeflate) | 텍스처 압축 해제 | MIT |
+
+<details>
+<summary>libdeflate 라이선스 전문</summary>
+
+```
+Copyright 2016 Eric Biggers
+Copyright 2024 Google LLC
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files
+(the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software,
+and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>
+
 <br><br>
 ---------------------------------------
 ---------------------------------------
@@ -170,3 +208,41 @@ When the mod is working, the following files appear in the `Game\Bin` folder aft
 | No Walkbys – Modular/All Worlds | Removes walkby Sims completely | [CurseForge](https://www.curseforge.com/sims4/mods/no-walkbys) |
 
 Both mods split their files by world, so you only need to install the files for the worlds you play in.
+
+## 8. License
+
+S4HQxNHQ uses the following open source software for texture decompression.
+
+| Name | Used for | License |
+|---|---|---|
+| [libdeflate](https://github.com/ebiggers/libdeflate) | Texture decompression | MIT |
+
+<details>
+<summary>libdeflate license text</summary>
+
+```
+Copyright 2016 Eric Biggers
+Copyright 2024 Google LLC
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation files
+(the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of the Software,
+and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+</details>

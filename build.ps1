@@ -3,7 +3,8 @@
 #   dist\로그수집용\Game\Bin\d3d11.dll  same code with detailed logging always on
 # Each mirrors the game folder layout (…\Game\Bin -> <The Sims 4>\Game\Bin).
 # -Dist <folder>: stage somewhere else (e.g. a separate test build); relative to this script.
-param([string]$Dist = '..\dist')
+# -LogOnly: only the log-collection build (test builds before a release).
+param([string]$Dist = '..\dist', [switch]$LogOnly)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $def = (Join-Path $PSScriptRoot 'd3d11.def') -replace '\\', '/'
@@ -20,8 +21,9 @@ if (Test-Path $dist) { Remove-Item -Recurse -Force $dist -Confirm:$false }
 
 # File properties (name, version, copyright): version.rc compiled with the
 # toolchain's windres. The version comes from VERSION in src\lib.rs.
-if ((Get-Content 'src\lib.rs' -Raw) -notmatch 'const VERSION: &str = "(\d+)\.(\d+)\.(\d+)"') { throw 'VERSION (x.y.z) not found in src\lib.rs' }
-$major = $Matches[1]; $minor = $Matches[2]; $patch = $Matches[3]
+# A test build carries a letter after it (1.1.1a = alpha), shown in the version text only.
+if ((Get-Content 'src\lib.rs' -Raw) -notmatch 'const VERSION: &str = "(\d+)\.(\d+)\.(\d+)([a-z]*)"') { throw 'VERSION (x.y.z) not found in src\lib.rs' }
+$major = $Matches[1]; $minor = $Matches[2]; $patch = $Matches[3]; $tag = $Matches[4]
 $windres = (Get-Command 'x86_64-w64-mingw32-windres.exe' -ErrorAction SilentlyContinue).Source
 if (-not $windres) {
     $cfg = Get-Content (Join-Path $env:USERPROFILE '.cargo\config.toml') -Raw
@@ -30,9 +32,11 @@ if (-not $windres) {
 if (-not $windres -or -not (Test-Path $windres)) { throw 'windres not found' }
 New-Item -ItemType Directory -Force 'target' | Out-Null
 
-foreach ($v in @(@{ name = '로그수집용'; key = 'diag'; args = '--features diag'; def = '-DDIAG' }, @{ name = '배포용'; key = 'normal'; args = ''; def = '' })) {
+$variants = @(@{ name = '로그수집용'; key = 'diag'; args = '--features diag'; def = '-DDIAG' })
+if (-not $LogOnly) { $variants += @{ name = '배포용'; key = 'normal'; args = ''; def = '' } }
+foreach ($v in $variants) {
     $res = (Join-Path $PSScriptRoot "target\version$($v.def).o") -replace '\\', '/'
-    Set-Content -Path 'target\ver.h' -Encoding ascii -Value @("#define VER_MAJOR $major", "#define VER_MINOR $minor", "#define VER_PATCH $patch", "#define VER_STR `"$major.$minor.$patch`"")
+    Set-Content -Path 'target\ver.h' -Encoding ascii -Value @("#define VER_MAJOR $major", "#define VER_MINOR $minor", "#define VER_PATCH $patch", "#define VER_STR `"$major.$minor.$patch$tag`"")
     $wargs = @('-c', '65001', '-O', 'coff')
     if ($v.def) { $wargs += $v.def }
     & $windres @wargs 'version.rc' '-o' $res

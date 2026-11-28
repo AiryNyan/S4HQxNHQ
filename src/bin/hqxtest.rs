@@ -5,6 +5,8 @@ mod bytes;
 mod inflate;
 #[path = "../lrle.rs"]
 mod lrle;
+#[path = "../pool.rs"]
+mod pool;
 #[path = "../rle.rs"]
 mod rle;
 #[path = "../vfs.rs"]
@@ -142,6 +144,16 @@ fn main() {
     let count: usize = a.get(2).and_then(|s| s.parse().ok()).unwrap_or(40);
     let only: Option<u8> = a.get(3).and_then(|s| s.parse().ok());
     let t0 = std::time::Instant::now();
+    // HQX_RUST_INFLATE=1: our own decoder only (libdeflate comparison)
+    if std::env::var_os("HQX_RUST_INFLATE").is_some() {
+        inflate::USE_LIBDEFLATE.store(false, std::sync::atomic::Ordering::Relaxed);
+        println!("inflate: own decoder only");
+    }
+    // HQX_NOSPLIT=1: every texture on one thread (splitting comparison)
+    if std::env::var_os("HQX_NOSPLIT").is_some() {
+        pool::SPLIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        println!("split: off");
+    }
     // HQX_BLANK=<out file>: write rle::blank() of the package's first RLES (experiment check)
     if let Some(out) = std::env::var_os("HQX_BLANK") {
         let d = std::fs::read(path).unwrap();
@@ -186,6 +198,83 @@ fn main() {
     }
     // HQX_BENCH=<kind>: time the upscaler over every texture of that kind and
     // print a hash of all outputs (to prove an optimization changes nothing).
+    // HQX_INFL=<kind>: inflate only, each texture 5 times: own decoder,
+    // libdeflate into a fresh buffer, libdeflate into one reused buffer.
+    if let Some(k) = std::env::var("HQX_INFL").ok().and_then(|s| s.parse::<u8>().ok()) {
+        let mut f = std::fs::File::open(path).unwrap();
+        let raws: Vec<(Vec<u8>, usize)> = pkg.ents.iter().filter(|e| e.kind == k && e.comp == 0x5A42).map(|e| {
+            let mut raw = vec![0u8; e.fsize as usize];
+            f.seek(SeekFrom::Start(e.off)).unwrap();
+            f.read_exact(&mut raw).unwrap();
+            (raw, e.msize as usize)
+        }).collect();
+        let total: usize = raws.iter().map(|r| r.1).sum();
+        let mut reuse = vec![0u8; raws.iter().map(|r| r.1).max().unwrap_or(0)];
+        for round in 0..3 {
+            for mode in 0..3 {
+                inflate::USE_LIBDEFLATE.store(mode != 0, std::sync::atomic::Ordering::Relaxed);
+                let t = std::time::Instant::now();
+                for _ in 0..5 {
+                    for (raw, ms) in &raws {
+                        if mode == 2 {
+                            assert!(inflate::whole_into(raw, &mut reuse[..*ms]));
+                        } else {
+                            let v = inflate::inflate_sized(raw, usize::MAX, *ms).unwrap();
+                            assert_eq!(v.len(), *ms);
+                        }
+                    }
+                }
+                let s = t.elapsed().as_secs_f64();
+                println!("round {round} {}: {:.0} MB/s", ["own, fresh buffer", "libdeflate, fresh buffer", "libdeflate, reused buffer"][mode], (total * 5) as f64 / s / 1e6);
+            }
+        }
+        return;
+    }
+    // HQX_SPLITBENCH=<kind>: the 40 largest textures of that kind upscaled
+    // over and over, alternating one thread and split, in one process.
+    if let Some(k) = std::env::var("HQX_SPLITBENCH").ok().and_then(|s| s.parse::<u8>().ok()) {
+        let mut f = std::fs::File::open(path).unwrap();
+        let mut es: Vec<_> = pkg.ents.iter().filter(|e| e.kind == k).collect();
+        es.sort_by_key(|e| std::cmp::Reverse(e.msize));
+        let fulls: Vec<Vec<u8>> = es.iter().step_by((es.len() / 120).max(1)).map(|e| {
+            let mut raw = vec![0u8; e.fsize as usize];
+            f.seek(SeekFrom::Start(e.off)).unwrap();
+            f.read_exact(&mut raw).unwrap();
+            if e.comp == 0x5A42 { inflate::inflate_sized(&raw, usize::MAX, e.msize as usize).unwrap() } else { raw }
+        }).collect();
+        // per texture: best of 5 in each mode; summed by work size bucket
+        let size = |d: &Vec<u8>| if k == 2 { lrle::parse_hdr(d).unwrap().offs[1] } else { d.len() };
+        let mut buckets = [[0u128; 3]; 5];
+        for d in &fulls {
+            let mut best = [u128::MAX; 2];
+            let mut all = Vec::new();
+            for _round in 0..5 {
+                for mode in 0..2 {
+                    pool::SPLIT.store(mode == 1, std::sync::atomic::Ordering::Relaxed);
+                    let t1 = std::time::Instant::now();
+                    let up = if k == 2 { lrle::upscale(d, None).unwrap().0 } else { rle::upscale(d).unwrap() };
+                    best[mode] = best[mode].min(t1.elapsed().as_micros());
+                    all.push(t1.elapsed().as_micros());
+                    std::hint::black_box(up);
+                }
+            }
+            if k == 2 && size(d) >= 256 << 10 {
+                let t1 = std::time::Instant::now();
+                lrle::scan_only(d).unwrap();
+                println!("  lrle {} KB: one {} us, split {} us, scan only {} us; every run (one, split, ...) {:?}", size(d) >> 10, best[0], best[1], t1.elapsed().as_micros(), all);
+            }
+            let b = match size(d) >> 10 { 0..=63 => 0, 64..=255 => 1, 256..=1023 => 2, 1024..=4095 => 3, _ => 4 };
+            buckets[b][0] += 1;
+            buckets[b][1] += best[0];
+            buckets[b][2] += best[1];
+        }
+        for (i, b) in buckets.iter().enumerate() {
+            if b[0] > 0 {
+                println!("kind {k} size {}: {} textures, one thread avg {} us, split avg {} us", ["<64K", "<256K", "<1M", "<4M", ">=4M"][i], b[0], b[1] / b[0], b[2] / b[0]);
+            }
+        }
+        return;
+    }
     if let Some(k) = std::env::var("HQX_BENCH").ok().and_then(|s| s.parse::<u8>().ok()) {
         let mut f = std::fs::File::open(path).unwrap();
         let (mut n, mut t_inf, mut t_up, mut hash, mut bytes) = (0u32, 0u128, 0u128, 0xcbf29ce484222325u64, 0usize);
@@ -217,7 +306,7 @@ fn main() {
             }
             n += 1;
         }
-        println!("bench kind {k}: {n} textures, inflate avg {} us, upscale avg {} us (worst {} us), output {} MB, hash {hash:016x}", t_inf / n.max(1) as u128, t_up / n.max(1) as u128, worst, bytes >> 20);
+                println!("bench kind {k}: {n} textures, inflate avg {} us, upscale avg {} us (worst {} us), output {} MB, hash {hash:016x}", t_inf / n.max(1) as u128, t_up / n.max(1) as u128, worst, bytes >> 20);
         return;
     }
     // A rebuild from the cached plan must give the same layout.

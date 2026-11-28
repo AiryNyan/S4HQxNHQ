@@ -156,59 +156,49 @@ const IDX2: [u8; 16] = {
     t
 };
 
-/// What one stream needs to be doubled: where it starts, which blocks own an
-/// element of it and that element's number.
-struct Src<'a> {
-    d: &'a [u8],
-    off: usize,
-    class: &'a [u8],
-    idx: &'a [u32],
-    /// Only translucent blocks (op 1) have an element in this stream.
-    translucent_only: bool,
-    bw: usize,
-    bh: usize,
-    /// Number of elements in the source stream.
-    n: usize,
-}
-
-/// Write the doubled stream into `out` (exactly `4 * s.n * B` bytes): every
-/// source element of `B` bytes yields four elements, in raster order of the
-/// doubled block grid. `f` maps a source element to the element for
-/// quadrant (qx, qy).
+/// Write the doubled elements of a range of source block rows into `out`
+/// (exactly `4 * n * B` bytes for `n` source elements). The elements of one
+/// stream that belong to one block row are contiguous in the source, so a row
+/// is doubled by walking that slice: each source row yields two output rows
+/// and each element of `B` bytes two neighbouring elements in each of them.
+/// `pre` holds the element number at the start of each row (and one past the
+/// last), `src` the elements from `pre[0]` on. `f` maps a source element to
+/// the element for quadrant (qx, qy).
 #[inline]
-fn fill<const B: usize>(s: &Src, out: &mut [u8], f: impl Fn(&[u8; B], usize, usize) -> [u8; B]) {
+fn fill<const B: usize>(src: &[u8], pre: &[u32], out: &mut [u8], f: impl Fn(&[u8; B], usize, usize) -> [u8; B]) {
+    let base = pre[0] as usize;
     let mut w = 0;
-    for oy in 0..s.bh * 2 {
-        let (sy, qy) = (oy / 2, oy & 1);
-        let (class, idx) = (&s.class[sy * s.bw..(sy + 1) * s.bw], &s.idx[sy * s.bw..(sy + 1) * s.bw]);
-        for (op, i) in class.iter().zip(idx) {
-            if *op == 0 || (s.translucent_only && *op != 1) {
-                continue;
+    for r in pre.windows(2) {
+        let row = &src[(r[0] as usize - base) * B..(r[1] as usize - base) * B];
+        let n = row.len() / B;
+        for qy in 0..2 {
+            for (o, c) in out[w..w + 2 * B * n].chunks_exact_mut(2 * B).zip(row.chunks_exact(B)) {
+                let c: &[u8; B] = c.try_into().unwrap();
+                o[..B].copy_from_slice(&f(c, 0, qy));
+                o[B..].copy_from_slice(&f(c, 1, qy));
             }
-            let p = s.off + *i as usize * B;
-            let src: &[u8; B] = s.d[p..p + B].try_into().unwrap();
-            out[w..w + B].copy_from_slice(&f(src, 0, qy));
-            out[w + B..w + 2 * B].copy_from_slice(&f(src, 1, qy));
-            w += 2 * B;
+            w += 2 * B * n;
         }
     }
 }
 
-/// Write the doubled stream `s` into `out`, which holds exactly its size.
-fn double_stream(s: &Src, bytes: usize, kind: Kind, out: &mut [u8]) -> Option<()> {
-    if out.len() != 4 * s.n * bytes {
+/// Double one stream over a range of block rows (see `fill`) into `out`,
+/// which holds exactly its size.
+fn double_stream(src: &[u8], pre: &[u32], bytes: usize, kind: Kind, out: &mut [u8]) -> Option<()> {
+    let n = (pre[pre.len() - 1] - pre[0]) as usize;
+    if out.len() != 4 * n * bytes || src.len() != n * bytes {
         return None;
     }
     match (kind, bytes) {
-        (Kind::Copy, 4) => fill::<4>(s, out, |v, _, _| *v),
-        (Kind::Copy, 2) => fill::<2>(s, out, |v, _, _| *v),
-        (Kind::Idx2, 4) => fill::<4>(s, out, |v, qx, qy| {
+        (Kind::Copy, 4) => fill::<4>(src, pre, out, |v, _, _| *v),
+        (Kind::Copy, 2) => fill::<2>(src, pre, out, |v, _, _| *v),
+        (Kind::Idx2, 4) => fill::<4>(src, pre, out, |v, qx, qy| {
             let (r0, r1) = (IDX2[((v[qy * 2] >> (qx * 4)) & 15) as usize], IDX2[((v[qy * 2 + 1] >> (qx * 4)) & 15) as usize]);
             [r0, r0, r1, r1]
         }),
         (Kind::Idx3, 6) => {
             let t3 = idx3_table();
-            fill::<6>(s, out, |v, qx, qy| {
+            fill::<6>(src, pre, out, |v, qx, qy| {
                 let x = u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], 0, 0]);
                 let pos = 3 * (qy * 8 + qx * 2);
                 let q = ((x >> pos) & 63) | (((x >> (pos + 12)) & 63) << 6);
@@ -216,7 +206,7 @@ fn double_stream(s: &Src, bytes: usize, kind: Kind, out: &mut [u8]) -> Option<()
                 [o[0], o[1], o[2], o[3], o[4], o[5]]
             })
         }
-        (Kind::Raw, 16) => fill::<16>(s, out, |v, qx, qy| {
+        (Kind::Raw, 16) => fill::<16>(src, pre, out, |v, qx, qy| {
             let mut o = [0u8; 16];
             for y in 0..4 {
                 let r = (qy * 2 + y / 2) * 4 + qx * 2;
@@ -316,6 +306,7 @@ pub fn transparent(magic: &[u8; 8], w: usize, h: usize, mips: usize, size: usize
 /// Exact 2x (pixel-doubling) upscale. The result has one more mip level: the
 /// new top level is generated, all original levels are reused unchanged.
 /// Output is padded with zeros to `bound()` so its size is known in advance.
+/// Large textures are doubled on several threads (see `pool::threads_for`).
 pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
     let h = parse_hdr(d)?;
     let total = d.len();
@@ -327,11 +318,14 @@ pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
-    // Expand mip 0 commands into per-block class + stream indices.
+    // Mip 0 commands as runs cut at block row ends, and per block row the
+    // number of non-transparent (pa) and translucent (pt) blocks before it:
+    // the element numbers where the row starts in the streams.
     let ncmd = h.m0(0, total) / 2;
-    let mut class = vec![0u8; nblk];
-    let mut ia = vec![0u32; nblk]; // index among non-transparent blocks
-    let mut it = vec![0u32; nblk]; // index among translucent blocks
+    let mut seg: Vec<(u8, u32)> = Vec::with_capacity(ncmd + bh);
+    let mut seg_at: Vec<u32> = Vec::with_capacity(bh + 1);
+    seg_at.push(0);
+    let (mut pa, mut pt) = (vec![0u32; bh + 1], vec![0u32; bh + 1]);
     let (mut pos, mut na, mut nt) = (0usize, 0u32, 0u32);
     for c in 0..ncmd {
         let cmd = u16at(d, h.offs[0][0] + c * 2);
@@ -339,18 +333,24 @@ pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
         if op == 3 || pos + cnt > nblk {
             return None;
         }
-        for b in pos..pos + cnt {
-            class[b] = op as u8;
+        let mut left = cnt;
+        while left > 0 {
+            let n = left.min(bw - pos % bw);
+            seg.push((op as u8, n as u32));
+            pos += n;
+            left -= n;
             if op != 0 {
-                ia[b] = na;
-                na += 1;
+                na += n as u32;
             }
             if op == 1 {
-                it[b] = nt;
-                nt += 1;
+                nt += n as u32;
+            }
+            if pos % bw == 0 {
+                seg_at.push(seg.len() as u32);
+                pa[pos / bw] = na;
+                pt[pos / bw] = nt;
             }
         }
-        pos += cnt;
     }
     if pos != nblk {
         return None;
@@ -364,7 +364,7 @@ pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
 
     // New mip 0 commands: every source block row twice, every run doubled.
     let mut cmds: Vec<u8> = Vec::with_capacity(4 * ncmd * 2 + 64);
-    let (mut run_op, mut run_len) = (class[0], 0usize);
+    let (mut run_op, mut run_len) = (seg[0].0, 0usize);
     let flush = |op: u8, mut len: usize, cmds: &mut Vec<u8>| {
         while len > 0 {
             let n = len.min(0x3FFF);
@@ -373,45 +373,39 @@ pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
         }
     };
     for oy in 0..bh * 2 {
-        for op in &class[(oy / 2) * bw..(oy / 2 + 1) * bw] {
-            if *op != run_op {
+        for &(op, n) in &seg[seg_at[oy / 2] as usize..seg_at[oy / 2 + 1] as usize] {
+            if op != run_op {
                 flush(run_op, run_len, &mut cmds);
-                run_op = *op;
+                run_op = op;
                 run_len = 0;
             }
-            run_len += 2;
+            run_len += 2 * n as usize;
         }
     }
     flush(run_op, run_len, &mut cmds);
 
-    // Assemble: new header, then each column = new mip 0 part + whole old
-    // column. The new mip 0 streams are written straight into the output.
+    // Layout: new header, then each column = new mip 0 part + whole old
+    // column. Everything but the new mip 0 streams is placed first.
     let nh = hdr_len_k(h.k, h.mips + 1);
-    let mut out = Vec::with_capacity(bound);
-    out.extend_from_slice(&d[0..8]);
-    out.extend_from_slice(&((h.w * 2) as u16).to_le_bytes());
-    out.extend_from_slice(&((h.h * 2) as u16).to_le_bytes());
-    out.extend_from_slice(&((h.mips + 1) as u16).to_le_bytes());
-    out.extend_from_slice(&d[14..16]);
-    out.resize(nh, 0);
+    let mut out = crate::pool::take(bound);
+    out[0..8].copy_from_slice(&d[0..8]);
+    out[8..10].copy_from_slice(&((h.w * 2) as u16).to_le_bytes());
+    out[10..12].copy_from_slice(&((h.h * 2) as u16).to_le_bytes());
+    out[12..14].copy_from_slice(&((h.mips + 1) as u16).to_le_bytes());
+    out[14..16].copy_from_slice(&d[14..16]);
+    let mut regions: Vec<(usize, usize)> = Vec::with_capacity(h.k); // (start, stream) of each new mip 0 stream
     let mut cur = nh;
     for j in 0..h.k {
         let (os, oe) = (h.offs[0][j], h.col_end(j, total));
         let newlen = if j == 0 {
-            out.extend_from_slice(&cmds);
             cmds.len()
         } else {
-            let (bytes, kind, both) = st[j - 1];
-            let n = if both { na } else { nt } as usize;
-            let src = Src { d, off: os, class: &class, idx: if both { &ia } else { &it }, translucent_only: !both, bw, bh, n };
-            let at = out.len();
-            if at + 4 * n * bytes > bound {
-                return None;
-            }
-            out.resize(at + 4 * n * bytes, 0);
-            double_stream(&src, bytes, kind, &mut out[at..])?;
-            4 * n * bytes
+            let (bytes, _, both) = st[j - 1];
+            4 * if both { na } else { nt } as usize * bytes
         };
+        if cur + newlen + (oe - os) > bound {
+            return None;
+        }
         let put = |out: &mut Vec<u8>, mip: usize, v: usize| {
             let o = 16 + (mip * h.k + j) * 4;
             out[o..o + 4].copy_from_slice(&(v as u32).to_le_bytes());
@@ -420,12 +414,67 @@ pub fn upscale(d: &[u8]) -> Option<Vec<u8>> {
         for i in 0..h.mips {
             put(&mut out, i + 1, cur + newlen + (h.offs[i][j] - os));
         }
-        out.extend_from_slice(&d[os..oe]);
+        if j == 0 {
+            out[cur..cur + newlen].copy_from_slice(&cmds);
+        } else {
+            regions.push((cur, j - 1));
+        }
+        out[cur + newlen..cur + newlen + (oe - os)].copy_from_slice(&d[os..oe]);
         cur += newlen + (oe - os);
     }
-    if out.len() > bound {
-        return None;
+
+    out[cur..].fill(0); // padding (a reused buffer holds old bytes)
+
+    // Block row ranges of about equal work, one per thread.
+    let threads = crate::pool::threads_for(total);
+    let work = |y: usize| pa[y] as usize + pt[y] as usize;
+    let mut cuts = vec![0usize];
+    for t in 1..threads {
+        let goal = work(bh) * t / threads;
+        let mut lo = cuts[cuts.len() - 1];
+        let mut hi = bh;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if work(mid) < goal { lo = mid + 1 } else { hi = mid }
+        }
+        cuts.push(lo);
     }
-    out.resize(bound, 0);
+    cuts.push(bh);
+
+    // Cut each new stream's region at those rows and hand the pieces out.
+    struct Job<'a> {
+        parts: Vec<(&'a mut [u8], usize)>, // (output piece, stream)
+        y0: usize,
+        y1: usize,
+    }
+    let mut jobs: Vec<Job> = (0..threads).map(|t| Job { parts: Vec::with_capacity(regions.len()), y0: cuts[t], y1: cuts[t + 1] }).collect();
+    let mut rest: &mut [u8] = &mut out[..];
+    let mut base = 0usize;
+    for &(start, s) in &regions {
+        let (bytes, _, both) = st[s];
+        let pre = if both { &pa } else { &pt };
+        let (_, r) = std::mem::take(&mut rest).split_at_mut(start - base);
+        let mut r = r;
+        base = start;
+        for job in jobs.iter_mut() {
+            let len = 4 * bytes * (pre[job.y1] - pre[job.y0]) as usize;
+            let (piece, r2) = r.split_at_mut(len);
+            job.parts.push((piece, s));
+            r = r2;
+            base += len;
+        }
+        rest = r;
+    }
+    let (pa, pt) = (&pa, &pt);
+    crate::pool::run_split(jobs, |job| {
+        for (piece, s) in job.parts {
+            let (bytes, kind, both) = st[s];
+            let pre = if both { pa } else { pt };
+            let os = h.offs[0][s + 1];
+            let src = &d[os + pre[job.y0] as usize * bytes..os + pre[job.y1] as usize * bytes];
+            double_stream(src, &pre[job.y0..=job.y1], bytes, kind, piece)?;
+        }
+        Some(())
+    })?;
     Some(out)
 }

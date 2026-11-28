@@ -80,6 +80,7 @@ impl Hdr {
 const IDX: u64 = 1 << 32; // symbol flag: palette index (otherwise a raw 4-byte pixel)
 
 /// Streaming decoder of one mip into symbols.
+#[derive(Clone)]
 struct Dec<'a> {
     d: &'a [u8],
     p: usize,
@@ -231,39 +232,83 @@ impl<'a> Dec<'a> {
             if self.p >= self.end {
                 return None;
             }
-            let b = self.byte()?;
-            if self.v2 {
-                if b & 1 != 0 {
-                    self.lit_left = self.cont(b, ((b >> 2) & 0x1F) as usize, 5)?;
-                    self.lit_raw = b & 2 != 0;
-                } else {
-                    let n = self.cont(b, ((b >> 3) & 0x0F) as usize, 4)?;
-                    self.run = match b & 7 {
-                        2 => IDX | self.byte()? as u64,
-                        4 => IDX | (self.byte()? as u64) | ((self.byte()? as u64) << 8),
-                        6 => self.raw()?,
-                        _ => {
-                            self.err = true;
-                            return None;
-                        }
-                    };
-                    self.run_left = n;
-                }
+            self.command()?;
+        }
+    }
+    /// Read one command and set up the run, literals or planar block it starts.
+    fn command(&mut self) -> Option<()> {
+        let b = self.byte()?;
+        if self.v2 {
+            if b & 1 != 0 {
+                self.lit_left = self.cont(b, ((b >> 2) & 0x1F) as usize, 5)?;
+                self.lit_raw = b & 2 != 0;
             } else {
-                match b & 3 {
-                    1 => {
-                        self.lit_left = (b >> 2) as usize;
-                        self.lit_raw = true;
+                let n = self.cont(b, ((b >> 3) & 0x0F) as usize, 4)?;
+                self.run = match b & 7 {
+                    2 => IDX | self.byte()? as u64,
+                    4 => IDX | (self.byte()? as u64) | ((self.byte()? as u64) << 8),
+                    6 => self.raw()?,
+                    _ => {
+                        self.err = true;
+                        return None;
                     }
-                    3 => self.planar((b >> 2) as usize)?,
-                    op => {
-                        let n = self.cont(b, ((b >> 2) & 0x1F) as usize, 5)?;
-                        self.run = if op == 2 { self.raw()? } else { 0 };
-                        self.run_left = n;
-                    }
+                };
+                self.run_left = n;
+            }
+        } else {
+            match b & 3 {
+                1 => {
+                    self.lit_left = (b >> 2) as usize;
+                    self.lit_raw = true;
+                }
+                3 => self.planar((b >> 2) as usize)?,
+                op => {
+                    let n = self.cont(b, ((b >> 2) & 0x1F) as usize, 5)?;
+                    self.run = if op == 2 { self.raw()? } else { 0 };
+                    self.run_left = n;
                 }
             }
         }
+        Some(())
+    }
+    /// Pass over `n` symbols without producing them (only commands and the
+    /// bytes of index literals are read). A level whose data ends early
+    /// continues with padding, as in `next_or_pad`.
+    fn skip(&mut self, mut n: usize) -> Option<()> {
+        while n > 0 {
+            if self.run_left > 0 {
+                let k = self.run_left.min(n);
+                self.run_left -= k;
+                n -= k;
+            } else if self.lit_left > 0 {
+                let k = self.lit_left.min(n);
+                if self.lit_raw {
+                    if self.p + 4 * k > self.end {
+                        self.err = true;
+                        return None;
+                    }
+                    self.p += 4 * k;
+                } else {
+                    for _ in 0..k {
+                        let b = self.byte()?;
+                        if b >= 0x80 {
+                            self.cont(b, 0, 7)?;
+                        }
+                    }
+                }
+                self.lit_left -= k;
+                n -= k;
+            } else if self.planar_pos < self.planar.len() {
+                let k = (self.planar.len() - self.planar_pos).min(n);
+                self.planar_pos += k;
+                n -= k;
+            } else if self.p >= self.end {
+                return Some(()); // the rest is padding
+            } else {
+                self.command()?;
+            }
+        }
+        Some(())
     }
 }
 
@@ -402,35 +447,20 @@ impl Enc {
     }
 }
 
-/// Exact 2x upscale. The mip count is kept: a new top level is generated and
-/// the smallest original level is dropped. The result is padded with no-op
-/// commands to `size` (default `bound()`). When the encoded top level does
-/// not fit it is replaced by a fully transparent one and `.1` holds the size
-/// that would have been needed.
-pub fn upscale(d: &[u8], size: Option<usize>) -> Option<(Vec<u8>, Option<usize>)> {
-    let h = parse_hdr(d)?;
-    let total = d.len();
-    let bound = size.unwrap_or(h.bound(total)?);
-    if !h.sane(total) || bound < h.base + h.offs[h.mips - 1] + 64 {
-        return None;
-    }
-    let (bw, bh) = (h.w / 4, h.h / 4);
-    if bw == 0 || bh == 0 {
-        return None;
-    }
-    let mut dec = Dec::new(d, h.base, h.base + h.offs[1], h.v2);
-    let mut enc = Enc { v2: h.v2, out: Vec::with_capacity(2 * h.offs[1] + 1024), lit: Vec::new(), cur: 0, len: 0 };
+/// Source block rows [y0, y1) of the top level, decoded from `dec` and
+/// encoded doubled into `enc` (each source block row becomes two output rows).
+fn encode_rows(dec: &mut Dec, enc: &mut Enc, bw: usize, y0: usize, y1: usize) -> Option<()> {
     let row_px = bw * 16;
     let mut row = vec![0u64; row_px];
     let mut uniform = vec![false; bw];
-    let mut y = 0;
-    while y < bh {
+    let mut y = y0;
+    while y < y1 {
         // One source block row becomes two output block rows (64 * bw pixels).
         let first = dec.next_or_pad()?;
         // Fast path: a repeat run covering whole block rows (large flat or
         // transparent areas) is passed on as one run. `run_left` > 0 means
         // `first` came from that run.
-        let whole = ((dec.run_left + 1) / row_px).min(bh - y);
+        let whole = ((dec.run_left + 1) / row_px).min(y1 - y);
         if whole > 0 {
             dec.run_left -= whole * row_px - 1;
             enc.push_n(first, 64 * bw * whole);
@@ -453,7 +483,11 @@ pub fn upscale(d: &[u8], size: Option<usize>) -> Option<(Vec<u8>, Option<usize>)
                     // each source row of the quadrant is emitted twice, each pixel doubled
                     for r in 0..2 {
                         let (a, b) = (top[r * 4 + qx * 2], top[r * 4 + qx * 2 + 1]);
-                        for _ in 0..2 {
+                        if a == b {
+                            enc.push_n(a, 8);
+                        } else {
+                            enc.push_n(a, 2);
+                            enc.push_n(b, 2);
                             enc.push_n(a, 2);
                             enc.push_n(b, 2);
                         }
@@ -463,29 +497,170 @@ pub fn upscale(d: &[u8], size: Option<usize>) -> Option<(Vec<u8>, Option<usize>)
         }
         y += 1;
     }
-    if dec.next().is_some() || dec.err {
+    Some(())
+}
+
+/// A large top level (compressed size from `SPLIT_MIN_BYTES`) is encoded
+/// in this many independent pieces (block row ranges), which can run on
+/// several threads. Fixed, so the output does not depend on how many
+/// threads were free.
+const PIECES: usize = 8;
+
+/// Pieces whose start in the data is known, handed out to the threads.
+struct Ready<'a> {
+    queue: std::collections::VecDeque<(usize, Dec<'a>)>,
+    scanned: bool,
+    failed: bool,
+    end: Option<Dec<'a>>,
+}
+
+/// Exact 2x upscale. The mip count is kept: a new top level is generated and
+/// the smallest original level is dropped. The result is padded with no-op
+/// commands to `size` (default `bound()`). When the encoded top level does
+/// not fit it is replaced by a fully transparent one and `.1` holds the size
+/// that would have been needed.
+pub fn upscale(d: &[u8], size: Option<usize>) -> Option<(Vec<u8>, Option<usize>)> {
+    let h = parse_hdr(d)?;
+    let total = d.len();
+    let bound = size.unwrap_or(h.bound(total)?);
+    if !h.sane(total) || bound < h.base + h.offs[h.mips - 1] + 64 {
         return None;
     }
+    let (bw, bh) = (h.w / 4, h.h / 4);
+    if bw == 0 || bh == 0 {
+        return None;
+    }
+    let pieces = if h.offs[1] >= crate::pool::SPLIT_MIN_BYTES && bh >= PIECES { PIECES } else { 1 };
+    let cut = |i: usize| bh * i / pieces;
+    let threads = if pieces > 1 { crate::pool::threads_for(h.offs[1]) } else { 1 };
+    let new_enc = |out: Vec<u8>| Enc { v2: h.v2, out, lit: Vec::new(), cur: 0, len: 0 };
+    // The output buffer, with room for the header in front: the first piece
+    // (on one thread every piece, one after another) is encoded straight
+    // into it, so only the other pieces are copied.
+    let mut out = crate::pool::take_empty(bound);
+    out.resize(h.base, 0);
+    let mut dec = Dec::new(d, h.base, h.base + h.offs[1], h.v2);
+    let mut encs: Vec<Enc> = Vec::with_capacity(pieces);
+    if threads <= 1 {
+        for i in 0..pieces {
+            let mut enc = new_enc(out);
+            let r = encode_rows(&mut dec, &mut enc, bw, cut(i), cut(i + 1));
+            out = enc.finish();
+            if r.is_none() {
+                crate::pool::give(out);
+                return None;
+            }
+        }
+    } else {
+        encs.push(new_enc(std::mem::take(&mut out)));
+        for _ in 1..pieces {
+            encs.push(new_enc(crate::pool::take_empty((2 * h.offs[1] + 1024) / pieces)));
+        }
+        // One thread passes over the data to find where each piece starts
+        // (much faster than decoding it) and hands each piece out as soon as
+        // its start is known; all threads, that one too once done, decode
+        // and encode the pieces.
+        let slots: Vec<std::sync::Mutex<&mut Enc>> = encs.iter_mut().map(std::sync::Mutex::new).collect();
+        let ready = std::sync::Mutex::new(Ready { queue: Default::default(), scanned: false, failed: false, end: None });
+        let cv = std::sync::Condvar::new();
+        let lock = || ready.lock().unwrap_or_else(|p| p.into_inner());
+        let start = dec.clone();
+        crate::pool::run_split((0..threads).collect(), |t| {
+            if t == 0 {
+                // marks the scan done however it ends (a panic too), so no thread waits forever
+                struct Done<'r, 'a>(&'r std::sync::Mutex<Ready<'a>>, &'r std::sync::Condvar);
+                impl Drop for Done<'_, '_> {
+                    fn drop(&mut self) {
+                        let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                        if !r.scanned {
+                            r.scanned = true;
+                            r.failed = true; // not reached the end normally
+                        }
+                        drop(r);
+                        self.1.notify_all();
+                    }
+                }
+                let _done = Done(&ready, &cv);
+                let mut sc = start.clone();
+                for i in 0..pieces {
+                    lock().queue.push_back((i, sc.clone()));
+                    cv.notify_one();
+                    if i + 1 < pieces && sc.skip((cut(i + 1) - cut(i)) * bw * 16).is_none() {
+                        lock().failed = true;
+                        break;
+                    }
+                }
+                let mut r = lock();
+                r.scanned = true;
+                drop(r);
+                cv.notify_all();
+            }
+            loop {
+                let (i, mut dc) = {
+                    let mut r = lock();
+                    loop {
+                        if let Some(p) = r.queue.pop_front() {
+                            break p;
+                        }
+                        if r.scanned {
+                            return Some(());
+                        }
+                        r = cv.wait(r).unwrap_or_else(|p| p.into_inner());
+                    }
+                };
+                let mut enc = slots[i].lock().unwrap_or_else(|p| p.into_inner());
+                if encode_rows(&mut dc, &mut enc, bw, cut(i), cut(i + 1)).is_none() {
+                    lock().failed = true;
+                } else if i + 1 == pieces {
+                    lock().end = Some(dc);
+                }
+            }
+        })?;
+        let r = ready.into_inner().unwrap_or_else(|p| p.into_inner());
+        if r.failed {
+            return None;
+        }
+        dec = r.end?;
+    }
     let keep = h.offs[h.mips - 1];
-    let mut top = enc.finish();
-    let needed = h.base + top.len() + keep;
+    let mut encs = encs.into_iter().map(Enc::finish);
+    if let Some(first) = encs.next() {
+        out = first;
+    }
+    for t in encs {
+        out.extend_from_slice(&t);
+        crate::pool::give(t);
+    }
+    if dec.next().is_some() || dec.err {
+        crate::pool::give(out);
+        return None;
+    }
+    let mut top_len = out.len() - h.base;
+    let needed = h.base + top_len + keep;
     let fits = needed <= bound;
     if !fits {
-        let mut e = Enc { v2: h.v2, out: Vec::new(), lit: Vec::new(), cur: 0, len: 0 };
+        out.truncate(h.base);
+        let mut e = Enc { v2: h.v2, out, lit: Vec::new(), cur: 0, len: 0 };
         e.repeat(0, h.w * h.h * 4);
-        top = e.out;
+        out = e.out;
+        top_len = out.len() - h.base;
     }
-    let mut out = Vec::with_capacity(bound);
-    out.extend_from_slice(&d[0..8]);
-    out.extend_from_slice(&((h.w * 2) as u16).to_le_bytes());
-    out.extend_from_slice(&((h.h * 2) as u16).to_le_bytes());
-    out.extend_from_slice(&(h.mips as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    // header: the same layout as the source, offsets moved by the new top level
+    let mut hd: Vec<u8> = Vec::with_capacity(h.base);
+    hd.extend_from_slice(&d[0..8]);
+    hd.extend_from_slice(&((h.w * 2) as u16).to_le_bytes());
+    hd.extend_from_slice(&((h.h * 2) as u16).to_le_bytes());
+    hd.extend_from_slice(&(h.mips as u32).to_le_bytes());
+    hd.extend_from_slice(&0u32.to_le_bytes());
     for i in 0..h.mips - 1 {
-        out.extend_from_slice(&((top.len() + h.offs[i]) as u32).to_le_bytes());
+        hd.extend_from_slice(&((top_len + h.offs[i]) as u32).to_le_bytes());
     }
-    out.extend_from_slice(&d[16 + 4 * h.mips..h.base]);
-    out.extend_from_slice(&top);
+    hd.extend_from_slice(&d[16 + 4 * h.mips..h.base]);
+    if hd.len() != h.base {
+        crate::pool::give(out);
+        return None;
+    }
+    out[..h.base].copy_from_slice(&hd);
     out.extend_from_slice(&d[h.base..h.base + keep]);
     // Padding lands in the last mip: use zero-length literal runs, which decode to nothing.
     out.resize(bound, if h.v2 { 3 } else { 1 });
@@ -552,4 +727,12 @@ pub fn decode(d: &[u8], mip: usize) -> Option<(usize, usize, Vec<u32>)> {
         return None;
     }
     Some((w, hh, px))
+}
+
+/// Benchmark: pass over the whole top level without decoding (cost of finding piece starts).
+#[allow(dead_code)]
+pub fn scan_only(d: &[u8]) -> Option<()> {
+    let h = parse_hdr(d)?;
+    let mut dec = Dec::new(d, h.base, h.base + h.offs[1], h.v2);
+    dec.skip(h.w * h.h)
 }

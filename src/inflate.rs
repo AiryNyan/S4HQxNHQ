@@ -147,8 +147,75 @@ pub fn inflate(src: &[u8], limit: usize) -> Option<Vec<u8>> {
     inflate_sized(src, limit, 0)
 }
 
+// libdeflate (third_party/libdeflate, MIT): whole-buffer decompression,
+// linked statically by build.rs.
+#[repr(C)]
+struct Decompressor {
+    _p: [u8; 0],
+}
+// The attribute (not build.rs) names the library, so every binary that
+// compiles this module links it too.
+#[link(name = "deflate", kind = "static")]
+extern "C" {
+    fn libdeflate_alloc_decompressor() -> *mut Decompressor;
+    fn libdeflate_zlib_decompress(d: *mut Decompressor, src: *const u8, n: usize, out: *mut u8, avail: usize, actual: *mut usize) -> i32;
+}
+
+/// Off = always use the decoder below (comparison runs in hqxtest).
+pub static USE_LIBDEFLATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+thread_local! {
+    // One decompressor per thread (a decompressor must not be shared); kept
+    // for the thread's lifetime.
+    static DEC: *mut Decompressor = unsafe { libdeflate_alloc_decompressor() };
+}
+
+/// A whole stream that decompresses to at most `expect` bytes, or None (any
+/// failure: the caller falls back to the decoder below).
+fn whole(src: &[u8], expect: usize) -> Option<Vec<u8>> {
+    let d = DEC.try_with(|d| *d).ok()?;
+    if d.is_null() {
+        return None;
+    }
+    // A kept buffer, or a new one left unwritten (libdeflate fills it; a
+    // damaged size that cannot be allocated fails here instead of aborting).
+    let mut out = match crate::pool::take_kept(expect) {
+        Some(v) => v,
+        None => {
+            let mut v: Vec<u8> = Vec::new();
+            v.try_reserve_exact(expect).ok()?;
+            v
+        }
+    };
+    let mut got = 0usize;
+    let r = unsafe { libdeflate_zlib_decompress(d, src.as_ptr(), src.len(), out.as_mut_ptr(), expect, &mut got) };
+    if r != 0 || got > expect {
+        crate::pool::give(out);
+        return None;
+    }
+    // SAFETY: libdeflate wrote `got` bytes at the start of the buffer, whose capacity is at least `expect`.
+    unsafe { out.set_len(got) };
+    Some(out)
+}
+
+/// libdeflate into a given buffer, which the stream must fill exactly (benchmark).
+#[allow(dead_code)]
+pub fn whole_into(src: &[u8], out: &mut [u8]) -> bool {
+    let Ok(d) = DEC.try_with(|d| *d) else { return false };
+    !d.is_null() && unsafe { libdeflate_zlib_decompress(d, src.as_ptr(), src.len(), out.as_mut_ptr(), out.len(), std::ptr::null_mut()) } == 0
+}
+
 /// `inflate` with the expected output size known in advance (0 = unknown).
 pub fn inflate_sized(src: &[u8], limit: usize, expect: usize) -> Option<Vec<u8>> {
+    // A full read (the limit allows more than the expected size): libdeflate,
+    // whose result for a valid stream is the same bytes. A stream it rejects
+    // (damaged, truncated, larger than expected) goes through the decoder
+    // below, so such inputs behave exactly as before.
+    if expect > 0 && limit > expect && USE_LIBDEFLATE.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Some(v) = whole(src, expect) {
+            return Some(v);
+        }
+    }
     if src.len() < 2 || (src[0] & 0x0F) != 8 {
         return None;
     }

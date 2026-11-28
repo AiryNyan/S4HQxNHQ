@@ -9,8 +9,10 @@
 
 mod bytes;
 mod cache;
+mod frames;
 mod inflate;
 mod lrle;
+mod pool;
 mod rle;
 mod sgr;
 mod vfs;
@@ -273,7 +275,7 @@ unsafe extern "system" fn veh(ep: *const [*const u8; 2]) -> i32 {
 
 // ------------------------------------------------------------ safety level
 
-const VERSION: &str = "1.0.1";
+const VERSION: &str = "1.1.1";
 
 fn level_path() -> std::path::PathBuf {
     exe_sibling("S4HQxNHQ.level")
@@ -333,6 +335,8 @@ static N_DIAG: AtomicU64 = AtomicU64::new(0);
 /// Time spent producing upscaled data (read + inflate + upscale), microseconds, and the slowest single read.
 static UP_US: AtomicU64 = AtomicU64::new(0);
 static UP_MAX_US: AtomicU64 = AtomicU64::new(0);
+/// Package and read position of the slowest virtual read (status line).
+static UP_MAX_AT: Mutex<String> = Mutex::new(String::new());
 
 fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -655,7 +659,10 @@ unsafe extern "system" fn h_readfile(h: P, buf: P, n: u32, read: *mut u32, ovl: 
             let r = pkg.read_virtual(pos, out, &mut cont);
             let us = t0.elapsed().as_micros() as u64;
             UP_US.fetch_add(us, Ordering::Relaxed);
-            UP_MAX_US.fetch_max(us, Ordering::Relaxed);
+            frames::work(us);
+            if UP_MAX_US.fetch_max(us, Ordering::Relaxed) < us {
+                *lk(&UP_MAX_AT) = format!("{} pos={pos} len={n}", pkg.name);
+            }
             *lk(&st.cont) = cont;
             r
         });
@@ -1036,6 +1043,16 @@ unsafe fn early_file_hook() {
                 commit,
                 HQ_SEEN.load(Ordering::Relaxed)
             ));
+            note(&format!(
+                "  slowest read: {}; upscales at once at most {}, split across threads {} (cores {}); buffers reused {} / new {}, kept {} MB",
+                lk(&UP_MAX_AT),
+                pool::ACTIVE_MAX.load(Ordering::Relaxed),
+                pool::SPLIT_COUNT.load(Ordering::Relaxed),
+                pool::cores(),
+                pool::REUSED.load(Ordering::Relaxed),
+                pool::FRESH.load(Ordering::Relaxed),
+                pool::kept() >> 20
+            ));
             let g = lk(diag());
             let (hq, other): (Vec<_>, Vec<_>) = g.iter().partition(|(k, _)| k.starts_with("HQ "));
             if !hq.is_empty() {
@@ -1046,6 +1063,9 @@ unsafe fn early_file_hook() {
                 let v: Vec<String> = other.iter().map(|(k, n)| format!("{k} x{n}")).collect();
                 note(&format!("  passed through, other size or format: {}", v.join(", ")));
             }
+        }
+        if let Some(l) = frames::status() {
+            note(&l);
         }
     }
 }
@@ -1083,7 +1103,11 @@ pub unsafe extern "system" fn D3D11CreateDevice(a: P, b: u32, c: P, d: u32, e: P
         return E_FAIL;
     }
     let o: CreateDevice = std::mem::transmute(r);
-    o(a, b, c, d, e, f, g, dev, fl, ctx)
+    let hr = o(a, b, c, d, e, f, g, dev, fl, ctx);
+    if hr >= 0 && !dev.is_null() && ACTIVE.load(Ordering::SeqCst) && verbose() {
+        frames::hook_device(*dev);
+    }
+    hr
 }
 
 #[no_mangle]
@@ -1093,7 +1117,16 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(a: P, b: u32, c: P, 
         return E_FAIL;
     }
     let o: CreateDeviceSC = std::mem::transmute(r);
-    o(a, b, c, d, e, f, g, scd, sc, dev, fl, ctx)
+    let hr = o(a, b, c, d, e, f, g, scd, sc, dev, fl, ctx);
+    if hr >= 0 && ACTIVE.load(Ordering::SeqCst) && verbose() {
+        if !dev.is_null() {
+            frames::hook_device(*dev);
+        }
+        if !sc.is_null() {
+            frames::hook_swap_chain(*sc);
+        }
+    }
+    hr
 }
 
 unsafe fn init() {
@@ -1145,7 +1178,7 @@ unsafe fn init() {
             note("troubleshooting mode (S4HQxNHQ.debug present): detailed logging, crash recorder and safety levels on, scan cache off");
         } else {
             if cfg!(feature = "diag") {
-                note("log-collection build: detailed logging and crash recorder on, otherwise identical to the normal build");
+                note("log-collection build: detailed logging, frame timing and crash recorder on, otherwise identical to the normal build");
             }
             cache::init(exe_sibling("S4HQxNHQ.cache"));
         }

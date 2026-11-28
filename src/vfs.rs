@@ -112,7 +112,7 @@ pub fn recent_stats() -> (usize, usize, usize) {
 }
 
 fn read_at(f: &mut File, off: u64, len: usize) -> Option<Vec<u8>> {
-    let mut v = vec![0u8; len];
+    let mut v = crate::pool::take(len);
     f.seek(SeekFrom::Start(off)).ok()?;
     let mut got = 0;
     while got < len {
@@ -574,6 +574,7 @@ impl Pkg {
         if !lk(&SEEN).get_or_insert_with(Default::default).insert((id, i)) {
             RECENT_AGAIN.fetch_add(1, Ordering::Relaxed);
         }
+        let _busy = crate::pool::Busy::new();
         let e = &self.ents[i];
         let mut head: Option<Vec<u8>> = None;
         let mut size_wrong = false;
@@ -590,25 +591,39 @@ impl Pkg {
             };
             // Stop at the size the index promises: a damaged stream must not
             // grow without limit (running out of memory ends the game).
-            let full = if e.comp == ZLIB { crate::inflate::inflate_sized(&raw, e.msize as usize + 1, e.msize as usize)? } else { raw };
+            let full = if e.comp == ZLIB {
+                let f = crate::inflate::inflate_sized(&raw, e.msize as usize + 1, e.msize as usize);
+                crate::pool::give(raw);
+                f?
+            } else {
+                raw
+            };
             if full.len() != e.msize as usize {
+                crate::pool::give(full);
                 return None;
             }
             head = Some(full[..full.len().min(512)].to_vec());
             let up = if e.kind == 4 {
-                rle::blank(&full)?
+                rle::blank(&full)
             } else if e.kind == 2 {
-                let (up, needed) = lrle::upscale(&full, Some(e.size as usize))?;
-                if let Some(needed) = needed {
-                    crate::note(&format!("LRLE too complex, served transparent (fixed from the next start): {} entry {}", self.name, e.ord));
-                    crate::report(&self.key, e.ord, needed as u32);
-                }
-                up
+                lrle::upscale(&full, Some(e.size as usize)).map(|(up, needed)| {
+                    if let Some(needed) = needed {
+                        crate::note(&format!("LRLE too complex, served transparent (fixed from the next start): {} entry {}", self.name, e.ord));
+                        crate::report(&self.key, e.ord, needed as u32);
+                    }
+                    up
+                })
             } else {
-                rle::upscale(&full)?
+                rle::upscale(&full)
             };
+            crate::pool::give(full);
+            let up = up?;
             size_wrong = up.len() != e.size as usize;
-            (!size_wrong).then_some(up)
+            if size_wrong {
+                crate::pool::give(up);
+                return None;
+            }
+            Some(up)
         })();
         let v = Arc::new(match data {
             Some(v) => v,
@@ -624,13 +639,17 @@ impl Pkg {
         });
         let mut c = lk(&RECENT);
         if let Some((_, _, w)) = c.0.iter().rev().find(|(p, k, _)| *p == id && *k == i) {
-            return w.clone(); // another thread finished the same texture first: keep one copy
+            let w = w.clone(); // another thread finished the same texture first: keep one copy
+            drop(c);
+            crate::pool::give_arc(v);
+            return w;
         }
         c.1 += v.len();
         c.0.push_back((id, i, v.clone()));
         while c.1 > RECENT_MAX && c.0.len() > 1 {
             if let Some((_, _, old)) = c.0.pop_front() {
                 c.1 -= old.len();
+                crate::pool::give_arc(old);
             }
         }
         v
